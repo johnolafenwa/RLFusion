@@ -194,3 +194,15 @@ uv pip install --upgrade build
 uv run python -m build --wheel
 ```
 Artifacts land in `./dist`.
+
+## Citation
+If you use RLFusion in your work, please cite:
+
+```bibtex
+@software{rlfusion,
+  title = {RLFusion},
+  author = {Olafenwa, John},
+  year = {2025},
+  url = {https://github.com/johnolafenwa/rlfusion}
+}
+```
