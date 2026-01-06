@@ -1,0 +1,55 @@
+import logging
+
+from torch.utils.data import Dataset
+
+from rlfusion.envs import EnvBase
+from rlfusion.trainers.sft_trainer import SFTTrainer
+
+
+class ToySFTDataset(Dataset):
+    def __init__(self) -> None:
+        self.samples = [
+            EnvBase(
+                prompt=[
+                    {"role": "system", "content": "Answer briefly and politely."},
+                    {"role": "user", "content": "What is 2 + 2?"},
+                ],
+                answer="The answer is 4.",
+            ),
+            EnvBase(
+                prompt=[
+                    {"role": "system", "content": "Be concise."},
+                    {"role": "user", "content": "Name a primary color."},
+                ],
+                answer="Red.",
+            ),
+        ]
+
+    def __getitem__(self, index: int) -> EnvBase:
+        return self.samples[index]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+
+def main() -> None:
+    dataset = ToySFTDataset()
+
+    trainer = SFTTrainer(
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        train_dataset=dataset,
+        eval_dataset=dataset,
+        num_steps=100,
+        batch_size=2,
+        saving_steps=2,
+        logging_steps=1,
+        enable_wandb=False,
+        output_dir="./outputs/sft_example",
+        log_level=logging.INFO,
+    )
+
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()

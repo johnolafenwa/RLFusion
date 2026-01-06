@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlfusion"
+version = "0.1.0"
+description = "Frontier post-training for LLMs"
+readme = "README.md"
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+authors = [
+    {name = "John Olafenwa", email = "johnolafenwa@gmail.com"},
+]
+dependencies = [
+    "accelerate>=1.12.0",
+    "torch",
+    "transformers",
+    "wandb",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest"
+]
+dev = [
+    "ruff",
+    "ty"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
