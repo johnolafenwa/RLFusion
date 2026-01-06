@@ -17,6 +17,7 @@ dependencies = [
     "torch",
     "transformers",
     "wandb",
+    "datasets"
 ]
 
 [project.optional-dependencies]

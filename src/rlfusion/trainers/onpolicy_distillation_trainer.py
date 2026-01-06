@@ -62,6 +62,8 @@ class OnPolicyDistillationTrainer:
         seed: int = 42,
         max_new_tokens: int = 1024,
         batch_size: int = 1,
+        ppo_steps: int = 1,
+        clip_eps: float = 0.2,
         log_completions: bool = False,
         max_log_chars: int = 320,
         max_grad_norm: Optional[float] = None,
@@ -81,6 +83,8 @@ class OnPolicyDistillationTrainer:
         self.max_new_tokens = max_new_tokens
         self.batch_size = batch_size
         self.generation_args = generation_args or {}
+        self.ppo_steps = ppo_steps
+        self.clip_eps = clip_eps
         self.log_completions = log_completions
         self.max_log_chars = max_log_chars
         self.max_grad_norm = max_grad_norm
@@ -145,6 +149,8 @@ class OnPolicyDistillationTrainer:
                         "seed": seed,
                         "max_new_tokens": max_new_tokens,
                         "batch_size": batch_size,
+                        "ppo_steps": ppo_steps,
+                        "clip_eps": clip_eps,
                     },
                 )
                 self._wandb = wandb
@@ -281,6 +287,21 @@ class OnPolicyDistillationTrainer:
 
         return torch.stack(masks, dim=0)
 
+    def _ppo_loss(
+        self,
+        old_log_probs: torch.Tensor,
+        new_log_probs: torch.Tensor,
+        advantages: torch.Tensor,
+        mask: torch.Tensor,
+        clip_eps: float,
+    ) -> torch.Tensor:
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        unclipped = ratio * advantages
+        clipped = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * advantages
+        obj = torch.minimum(unclipped, clipped) * mask
+        denom = mask.sum(dim=1).clamp_min(1.0)
+        return -(obj.sum(dim=1) / denom)
+
     def _log_step(
         self,
         step: int,
@@ -359,23 +380,35 @@ class OnPolicyDistillationTrainer:
             env_batch = [self.train_dataset[random.randint(0, dataset_len - 1)] for _ in range(self.batch_size)]
 
             sequences, texts, prompt_lens, completion_lens = self.sample_completions_batch(env_batch)
-            student_log_probs = self.get_log_probs(sequences)
             with torch.no_grad():
+                old_log_probs = self.get_log_probs(sequences)
                 teacher_log_probs = self.get_log_probs(sequences, model=self.teacher_model)
 
             masks = self._build_masks(prompt_lens, completion_lens, sequences)
             mask_counts = masks.sum(dim=1).clamp_min(1.0)
-            reverse_kl = (student_log_probs - teacher_log_probs) * masks
-            loss_per = reverse_kl.sum(dim=1) / mask_counts
-            loss = loss_per.mean()
+            reverse_kl = (old_log_probs - teacher_log_probs) * masks
+            advantages = -reverse_kl
 
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if self.max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            self.optimizer.step()
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step()
+            loss = None
+            for ppo_step in range(self.ppo_steps):
+                self.optimizer.zero_grad(set_to_none=True)
+                new_log_probs = self.get_log_probs(sequences)
+                loss_per = self._ppo_loss(
+                    old_log_probs,
+                    new_log_probs,
+                    advantages,
+                    masks,
+                    clip_eps=self.clip_eps,
+                )
+                loss = loss_per.mean()
+                loss.backward()
+                if self.max_grad_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
+
+            reverse_kl_mean = float((reverse_kl.sum(dim=1) / mask_counts).mean().item())
 
             rewards = [
                 self._compute_reward(env, completion)
@@ -394,8 +427,8 @@ class OnPolicyDistillationTrainer:
                 step,
                 env_batch[0],
                 texts,
-                loss_value=float(loss.item()),
-                kl_value=float(loss_per.mean().item()),
+                loss_value=float(loss.item() if loss is not None else 0.0),
+                kl_value=reverse_kl_mean,
                 mask_tokens_mean=float(mask_counts.mean().item()),
                 completion_tokens_mean=float(torch.tensor(completion_lens, dtype=torch.float32).mean().item()),
                 reward_mean=reward_mean,

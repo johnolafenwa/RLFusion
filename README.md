@@ -207,6 +207,16 @@ To enable W&B logging, pass `enable_wandb=True` to a trainer and optionally set:
 - `wandb_project` (default: `sft`, `grpo`, or `onpolicy_distill`)
 - `wandb_run_name`
 
+Login with `uv`:
+```bash
+uv run wandb login
+```
+
+Or non-interactive:
+```bash
+uv run wandb login $WANDB_API_KEY
+```
+
 Example:
 ```python
 trainer = SFTTrainer(

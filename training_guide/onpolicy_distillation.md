@@ -6,6 +6,8 @@ Recommended starting point:
 - optimizer: AdamW
 - learning rate: 1e-5
 - sampling temperature: 0.6 to 0.8
+- ppo steps: 1 to 2
+- clip eps: 0.2
 - max new tokens: 64 to 256
 - batch size: 1 to 4 (per device)
 - max grad norm: 1.0
