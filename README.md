@@ -197,6 +197,22 @@ If you prefer not to install it, you can run:
 uvx ty check src tests
 ```
 
+## Weights & Biases Logging
+To enable W&B logging, pass `enable_wandb=True` to a trainer and optionally set:
+- `wandb_project` (default: `sft`, `grpo`, or `onpolicy_distill`)
+- `wandb_run_name`
+
+Example:
+```python
+trainer = SFTTrainer(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    train_dataset=dataset,
+    enable_wandb=True,
+    wandb_project="rlfusion",
+    wandb_run_name="sft-demo",
+)
+```
+
 ## Build a Wheel
 ```bash
 uv pip install --upgrade build
