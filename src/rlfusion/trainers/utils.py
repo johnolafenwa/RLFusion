@@ -52,7 +52,7 @@ def truncate_text(text: Optional[str], max_chars: Optional[int]) -> str:
         return text
     if len(text) <= max_chars:
         return text
-    return text[:max_chars] + "...<truncated>"
+    return "...<truncated>" + text[-max_chars:]
 
 
 def format_prompt(prompt: list[dict]) -> str:
