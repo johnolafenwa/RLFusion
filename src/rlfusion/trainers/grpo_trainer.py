@@ -53,10 +53,11 @@ class GRPOTrainer():
                  sampling_temperature: float = 1.0,
                  kl_penalty: float = 0.0,
                  output_dir: str = "./outputs",
+                 generation_args: Optional[dict[str, Any]] = None,
                  optimizer: type[Optimizer] = AdamW,
                  optimizer_args: Optional[dict[str, Any]] = None,
                  lr_scheduler: Optional[type[LRScheduler] | LRScheduler] = None,
-                 lr_scheduler_args: Optional[dict[str, object]] = None,
+                 lr_scheduler_args: Optional[dict[str, Any]] = None,
                  seed: int = 42,
                  max_new_tokens: int = 1024,
                  batch_size: int = 1,
@@ -84,6 +85,7 @@ class GRPOTrainer():
         self.logging_steps = logging_steps
         self.max_new_tokens = max_new_tokens
         self.batch_size = batch_size
+        self.generation_args = generation_args or {}
         self.group_size = group_size
         self.ppo_steps = ppo_steps
         self.clip_eps = clip_eps
@@ -228,17 +230,22 @@ class GRPOTrainer():
         attention_mask = input_tokens["attention_mask"]
         prompt_lengths = attention_mask.sum(dim=1).tolist()
 
-        outputs = cast(GenerateOutput, self.model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            do_sample=True,
-            temperature=self.sampling_temperature,
-            max_new_tokens=self.max_new_tokens,
-            pad_token_id=self.tokenizer.pad_token_id,
-            return_dict_in_generate=True,
-            output_scores=True,
-            use_cache=False
-        ))
+        gen_kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "do_sample": True,
+            "temperature": self.sampling_temperature,
+            "max_new_tokens": self.max_new_tokens,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "return_dict_in_generate": True,
+            "output_scores": True,
+            "use_cache": False,
+        }
+        if self.generation_args:
+            gen_kwargs.update(self.generation_args)
+        gen_kwargs["return_dict_in_generate"] = True
+
+        outputs = cast(GenerateOutput, self.model.generate(**gen_kwargs))
 
         generated_sequences = outputs.sequences
         ret_texts = []

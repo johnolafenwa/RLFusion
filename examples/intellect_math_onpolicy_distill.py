@@ -1,7 +1,7 @@
 import logging
 
 from rlfusion.datasets import IntellectMathDataset
-from rlfusion.trainers.grpo_trainer import GRPOTrainer
+from rlfusion.trainers.onpolicy_distillation_trainer import OnPolicyDistillationTrainer
 
 
 def main() -> None:
@@ -16,8 +16,9 @@ def main() -> None:
         seed=123,
     )
 
-    trainer = GRPOTrainer(
-        model="Qwen/Qwen2.5-0.5B-Instruct",
+    trainer = OnPolicyDistillationTrainer(
+        model="Qwen/Qwen3-4B-Instruct-2507",
+        teacher_model="Qwen/Qwen3-8B",
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         num_steps=5,
@@ -25,11 +26,9 @@ def main() -> None:
         logging_steps=1,
         enable_wandb=False,
         sampling_temperature=0.7,
-        kl_penalty=0.0,
-        output_dir="./outputs/grpo_intellect_math",
+        output_dir="./outputs/onpolicy_distill_intellect_math",
         generation_args={"top_p": 0.9},
-        group_size=2,
-        ppo_steps=1,
+        batch_size=2,
         max_new_tokens=128,
         log_completions=True,
         max_log_chars=200,

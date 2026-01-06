@@ -14,6 +14,11 @@ From the repo root:
 uv pip install -e .
 ```
 
+If you don't have `uv` installed:
+```bash
+python -m pip install uv
+```
+
 ## Flash Attention (Optional)
 If you have a CUDA-enabled GPU and want FlashAttention2:
 
