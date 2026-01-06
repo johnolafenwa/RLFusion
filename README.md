@@ -14,6 +14,15 @@ From the repo root:
 uv pip install -e .
 ```
 
+## Flash Attention (Optional)
+If you have a CUDA-enabled GPU and want FlashAttention2:
+
+```bash
+uv pip install flash-attn --no-build-isolation
+```
+
+If FlashAttention is not available, the trainers automatically fall back to PyTorch SDPA.
+
 ## Dev Setup
 ```bash
 uv pip install -e ".[dev,test]"

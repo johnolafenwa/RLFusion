@@ -20,7 +20,7 @@ else:
 
 from transformers import AutoTokenizer
 
-from rlfusion.trainers.utils import get_device, set_seed, configure_torch_backends
+from rlfusion.trainers.utils import get_device, set_seed, configure_torch_backends, resolve_attention_implementation
 
 logger = logging.getLogger(__name__)
 if _USING_LIGER:
@@ -78,10 +78,11 @@ class SFTTrainer:
         self.device = device
         self.device_map = device_map
 
+        attn_implementation = resolve_attention_implementation(device_map)
         self.model = AutoModelForCausalLM.from_pretrained(
             model,
             device_map=device_map,
-            attn_implementation="flash_attention_2" if device_map == "auto" else "sdpa",
+            attn_implementation=attn_implementation,
             dtype=torch.bfloat16,
         )
         self.model.config.use_cache = False

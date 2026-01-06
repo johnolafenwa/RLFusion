@@ -28,6 +28,7 @@ from rlfusion.trainers.utils import (
     configure_torch_backends,
     truncate_text,
     format_prompt,
+    resolve_attention_implementation,
 )
 from rlfusion.trainers.types import GenerateOutput
 from rlfusion.envs import EnvBase
@@ -109,10 +110,11 @@ class GRPOTrainer():
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
 
+        attn_implementation = resolve_attention_implementation(device_map)
         self.model = AutoModelForCausalLM.from_pretrained(
                 model,
                 device_map=device_map,
-                attn_implementation="flash_attention_2" if device_map == "auto" else "sdpa",
+                attn_implementation=attn_implementation,
                 dtype=torch.bfloat16
             )
 
@@ -126,7 +128,7 @@ class GRPOTrainer():
             self.ref_model = AutoModelForCausalLM.from_pretrained(
                 model,
                 device_map=device_map,
-                attn_implementation="flash_attention_2",
+                attn_implementation=attn_implementation,
                 dtype=torch.bfloat16
             )
 

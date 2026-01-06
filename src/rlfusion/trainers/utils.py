@@ -1,7 +1,9 @@
-import torch
+import importlib.util
 import random
-import numpy as np
 from typing import Optional
+
+import numpy as np
+import torch
 
 def get_device():
 
@@ -31,6 +33,16 @@ def configure_torch_backends():
         torch.backends.cudnn.benchmark = True
         # Ensure deterministic behavior is off for speed (set True if reproducibility is critical)
         torch.backends.cudnn.deterministic = False
+
+
+def resolve_attention_implementation(device_map: str) -> str:
+    if device_map != "auto":
+        return "sdpa"
+    if not torch.cuda.is_available():
+        return "sdpa"
+    if importlib.util.find_spec("flash_attn") is None:
+        return "sdpa"
+    return "flash_attention_2"
 
 
 def truncate_text(text: Optional[str], max_chars: int) -> str:

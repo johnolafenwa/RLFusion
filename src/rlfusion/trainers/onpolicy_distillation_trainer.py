@@ -28,6 +28,7 @@ from rlfusion.trainers.utils import (
     configure_torch_backends,
     truncate_text,
     format_prompt,
+    resolve_attention_implementation,
 )
 from rlfusion.trainers.types import GenerateOutput
 
@@ -92,10 +93,11 @@ class OnPolicyDistillationTrainer:
         self.device = device
         self.device_map = device_map
 
+        attn_implementation = resolve_attention_implementation(device_map)
         self.model = AutoModelForCausalLM.from_pretrained(
             model,
             device_map=device_map,
-            attn_implementation="flash_attention_2" if device_map == "auto" else "sdpa",
+            attn_implementation=attn_implementation,
             dtype=torch.bfloat16,
         )
         self.model.config.use_cache = False
@@ -103,7 +105,7 @@ class OnPolicyDistillationTrainer:
         self.teacher_model = AutoModelForCausalLM.from_pretrained(
             teacher_model,
             device_map=device_map,
-            attn_implementation="flash_attention_2" if device_map == "auto" else "sdpa",
+            attn_implementation=attn_implementation,
             dtype=torch.bfloat16,
         )
         self.teacher_model.config.use_cache = False
