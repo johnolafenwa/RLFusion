@@ -65,7 +65,7 @@ class GRPOTrainer():
                  ppo_steps: int = 2,
                  clip_eps: float = 0.2,
                  log_completions: bool = False,
-                 max_log_chars: int = 320,
+                 max_log_chars: Optional[int] = 320,
                  max_error: float = 100.0,
                  invalid_penalty: float = 1.0,
                  max_grad_norm: Optional[float] = None,
@@ -427,9 +427,16 @@ class GRPOTrainer():
         if self.log_completions:
             prompt_text = format_prompt(env.prompt)
             logger.info("prompt: %s", truncate_text(prompt_text, self.max_log_chars))
+            answer_text = None if env.answer is None else str(env.answer)
+            logger.info("gt_answer: %s", truncate_text(answer_text, self.max_log_chars))
             for idx, traj in enumerate(trajectories):
                 completion_preview = truncate_text(traj.completion_text, self.max_log_chars)
-                logger.info("traj %d reward=%.4f completion=%s", idx, traj.reward, completion_preview)
+                logger.info(
+                    "generated_%d reward=%.4f: %s",
+                    idx,
+                    traj.reward,
+                    completion_preview,
+                )
 
         if self._wandb is not None:
             self._wandb.log(
@@ -612,9 +619,11 @@ class GRPOTrainer():
         if self.log_completions and first_env is not None and first_completions is not None:
             prompt_text = format_prompt(first_env.prompt)
             logger.info("prompt: %s", truncate_text(prompt_text, self.max_log_chars))
+            answer_text = None if first_env.answer is None else str(first_env.answer)
+            logger.info("gt_answer: %s", truncate_text(answer_text, self.max_log_chars))
             for idx, completion in enumerate(first_completions):
                 completion_preview = truncate_text(completion, self.max_log_chars)
-                logger.info("sample %d completion=%s", idx, completion_preview)
+                logger.info("generated_%d: %s", idx, completion_preview)
 
         self.model.train()
 

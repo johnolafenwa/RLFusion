@@ -65,7 +65,7 @@ class OnPolicyDistillationTrainer:
         ppo_steps: int = 1,
         clip_eps: float = 0.2,
         log_completions: bool = False,
-        max_log_chars: int = 320,
+        max_log_chars: Optional[int] = 320,
         max_grad_norm: Optional[float] = None,
         log_level: int = logging.INFO,
     ):
@@ -344,9 +344,11 @@ class OnPolicyDistillationTrainer:
         if self.log_completions:
             prompt_text = format_prompt(env.prompt)
             logger.info("prompt: %s", truncate_text(prompt_text, self.max_log_chars))
+            answer_text = None if env.answer is None else str(env.answer)
+            logger.info("gt_answer: %s", truncate_text(answer_text, self.max_log_chars))
             for idx, completion in enumerate(completions):
                 completion_preview = truncate_text(completion, self.max_log_chars)
-                logger.info("sample %d completion=%s", idx, completion_preview)
+                logger.info("generated_%d: %s", idx, completion_preview)
 
         if self._wandb is not None:
             metrics = {

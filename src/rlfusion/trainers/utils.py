@@ -45,9 +45,11 @@ def resolve_attention_implementation(device_map: str) -> str:
     return "flash_attention_2"
 
 
-def truncate_text(text: Optional[str], max_chars: int) -> str:
+def truncate_text(text: Optional[str], max_chars: Optional[int]) -> str:
     if text is None:
         return "<none>"
+    if max_chars is None:
+        return text
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + "...<truncated>"
