@@ -144,33 +144,35 @@ class SFTTrainer:
             )
         logger.setLevel(log_level)
 
-    def _extract_sample(self, sample: Any) -> Tuple[Any, str]:
-        if isinstance(sample, tuple) or isinstance(sample, list):
-            if len(sample) != 2:
-                raise ValueError("Tuple/list samples must be (prompt, response).")
-            return sample[0], sample[1]
-
+    def _extract_sample(self, sample: Any) -> Tuple[list[dict[str, object]], Optional[str]]:
         if isinstance(sample, dict):
-            prompt = sample.get("prompt") or sample.get("messages") or sample.get("input")
-            response = sample.get("response") or sample.get("completion") or sample.get("answer") or sample.get("output")
-            if prompt is None or response is None:
-                raise ValueError("Dict samples must include prompt/messages/input and response/completion/answer/output.")
-            return prompt, response
+            prompt = sample.get("prompt")
+            answer = sample.get("answer")
+        else:
+            prompt = getattr(sample, "prompt", None)
+            answer = getattr(sample, "answer", None)
 
-        prompt = getattr(sample, "prompt", None)
-        response = getattr(sample, "response", None)
-        if response is None:
-            response = getattr(sample, "completion", None)
-        if response is None:
-            response = getattr(sample, "answer", None)
-        if prompt is None or response is None:
-            raise ValueError("Sample must provide prompt and response/answer/completion.")
-        return prompt, response
+        if prompt is None:
+            raise ValueError("Sample must include a prompt list of role/content dicts.")
+        return self._normalize_prompt(prompt), None if answer is None else str(answer)
 
-    def _normalize_prompt(self, prompt: Any) -> Any:
-        if isinstance(prompt, str):
-            return [{"role": "user", "content": prompt}]
-        return prompt
+    def _normalize_prompt(self, prompt: Any) -> list[dict[str, object]]:
+        if not isinstance(prompt, list):
+            raise ValueError("Prompt must be a list of role/content dicts.")
+        normalized: list[dict[str, object]] = []
+        for msg in prompt:
+            if not isinstance(msg, dict):
+                raise ValueError("Each prompt message must be a dict with role/content.")
+            if "role" not in msg or "content" not in msg:
+                raise ValueError("Each prompt message must include role and content.")
+            role = msg["role"]
+            if role not in {"system", "user", "assistant"}:
+                raise ValueError(f"Unsupported role: {role}")
+            content = msg["content"]
+            if not isinstance(content, str):
+                content = str(content)
+            normalized.append({"role": role, "content": content})
+        return normalized
 
     def _apply_chat_template_ids(self, messages: list[dict[str, object]]) -> list[int]:
         token_ids = self.tokenizer.apply_chat_template(
@@ -189,14 +191,14 @@ class SFTTrainer:
         for idx in range(len(messages)):
             current_ids = self._apply_chat_template_ids(messages[: idx + 1])
             cur_len = len(current_ids)
-            if messages[idx].get("role") in ["user", "system"]:
+            if messages[idx].get("role") == "user":
                 for j in range(prev_len, cur_len):
                     if j < len(user_mask):
                         user_mask[j] = True
             prev_len = cur_len
         return full_ids, user_mask
 
-    def _build_batch(self, prompts: Iterable[Any], responses: Iterable[str]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _build_batch(self, prompts: Iterable[Any], responses: Iterable[Optional[str]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_input_ids: list[list[int]] = []
         batch_attention_mask: list[list[int]] = []
         batch_labels: list[list[int]] = []
@@ -204,7 +206,9 @@ class SFTTrainer:
         for prompt, response in zip(prompts, responses):
             prompt = self._normalize_prompt(prompt)
 
-            messages = list(prompt) + [{"role": "assistant", "content": response}]
+            messages = list(prompt)
+            if response is not None:
+                messages.append({"role": "assistant", "content": response})
             input_ids, user_mask = self._chat_ids_and_user_mask(messages)
             if self.max_seq_len is not None and len(input_ids) > self.max_seq_len:
                 input_ids = input_ids[: self.max_seq_len]
@@ -252,7 +256,7 @@ class SFTTrainer:
             for sample in batch_samples:
                 prompt, response = self._extract_sample(sample)
                 prompts.append(prompt)
-                responses.append(str(response))
+                responses.append(None if response is None else str(response))
 
             input_ids, attention_mask, labels = self._build_batch(prompts, responses)
 
@@ -325,7 +329,7 @@ class SFTTrainer:
             for sample in batch_samples:
                 prompt, response = self._extract_sample(sample)
                 prompts.append(prompt)
-                responses.append(str(response))
+                responses.append(None if response is None else str(response))
 
             input_ids, attention_mask, labels = self._build_batch(prompts, responses)
 
