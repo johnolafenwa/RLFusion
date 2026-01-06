@@ -20,13 +20,7 @@ uv pip install -e ".[dev,test]"
 ```
 
 ## Quickstart
-Use the provided examples:
-
-```bash
-python examples/sft_trainer_example.py
-python examples/grpo_trainer_math.py
-python examples/onpolicy_distillation_example.py
-```
+Minimal, inline examples for each trainer are included below.
 
 ## Core Concepts
 ### Environment
@@ -48,11 +42,131 @@ env = EnvBase(
 ### SFT
 `SFTTrainer` consumes `(prompt, answer)` and masks any `user`-role tokens while training all other tokens. It accepts `train_dataset` and optional `eval_dataset`, and exposes `test()` for evaluation.
 
+```python
+from torch.utils.data import Dataset
+
+from rlfusion.envs import EnvBase
+from rlfusion.trainers.sft_trainer import SFTTrainer
+
+
+class ToySFTDataset(Dataset):
+    def __init__(self) -> None:
+        self.samples = [
+            EnvBase(
+                prompt=[
+                    {"role": "system", "content": "Be concise."},
+                    {"role": "user", "content": "What is 2 + 2?"},
+                ],
+                answer="4",
+            )
+        ]
+
+    def __getitem__(self, index: int) -> EnvBase:
+        return self.samples[index]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+
+trainer = SFTTrainer(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    train_dataset=ToySFTDataset(),
+    eval_dataset=ToySFTDataset(),
+    num_steps=2,
+    batch_size=1,
+    saving_steps=2,
+    logging_steps=1,
+)
+trainer.train()
+```
+
 ### RLVR (GRPO)
 `GRPOTrainer` samples completions from the model, computes rewards via the environment, and optimizes a GRPO objective. It accepts `train_dataset` and optional `eval_dataset`, and exposes `test()` for evaluation.
 
+```python
+from rlfusion.envs import EnvBase
+from rlfusion.trainers.grpo_trainer import GRPOTrainer
+from rlfusion.utils import get_boxed_answer
+
+
+class SimpleMathEnv(EnvBase):
+    def get_reward(self, prediction: str) -> float:
+        if self.answer is None:
+            return 0.0
+        boxed = get_boxed_answer(prediction)
+        return 1.0 if boxed == str(self.answer) else 0.0
+
+
+dataset = [
+    SimpleMathEnv(
+        prompt=[{"role": "user", "content": "What is 2 + 2?"}],
+        answer="4",
+    ),
+    SimpleMathEnv(
+        prompt=[{"role": "user", "content": "What is 3 + 5?"}],
+        answer="8",
+    ),
+]
+
+trainer = GRPOTrainer(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    train_dataset=dataset,
+    eval_dataset=dataset,
+    num_steps=2,
+    saving_steps=2,
+    logging_steps=1,
+    group_size=2,
+    ppo_steps=1,
+    max_new_tokens=64,
+)
+trainer.train()
+```
+
 ### On-policy Distillation
 `OnPolicyDistillationTrainer` samples from the student and minimizes reverse KL to a fixed teacher distribution over completion tokens. It accepts `train_dataset` and optional `eval_dataset`, and exposes `test()` for evaluation.
+
+```python
+from rlfusion.envs import EnvBase
+from rlfusion.trainers.onpolicy_distillation_trainer import OnPolicyDistillationTrainer
+from rlfusion.utils import get_boxed_answer
+
+
+class SimpleMathEnv(EnvBase):
+    def get_reward(self, prediction: str) -> float:
+        if self.answer is None:
+            return 0.0
+        boxed = get_boxed_answer(prediction)
+        return 1.0 if boxed == str(self.answer) else 0.0
+
+
+dataset = [
+    SimpleMathEnv(
+        prompt=[{"role": "user", "content": "What is 2 + 2?"}],
+        answer="4",
+    ),
+    SimpleMathEnv(
+        prompt=[{"role": "user", "content": "What is 3 + 5?"}],
+        answer="8",
+    ),
+]
+
+trainer = OnPolicyDistillationTrainer(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    teacher_model="Qwen/Qwen2.5-1.5B-Instruct",
+    train_dataset=dataset,
+    eval_dataset=dataset,
+    num_steps=2,
+    saving_steps=2,
+    logging_steps=1,
+    max_new_tokens=64,
+)
+trainer.train()
+```
+
+## Training Guides
+- SFT: `training_guide/sft.md`
+- GRPO: `training_guide/grpo.md`
+- On-policy distillation: `training_guide/onpolicy_distillation.md`
 
 ## Testing
 ```bash

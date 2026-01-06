@@ -30,7 +30,7 @@ class MathDataEnv(EnvBase):
             else:
                 if not isinstance(self.answer, (int, float)):
                     return -self.max_error
-                diff = abs(float(self.answer) - numeric_value)
+                diff = abs(float(self.answer) - numeric_value) ** 2
                 diff = min(diff, self.max_error)
                 return -diff
 
