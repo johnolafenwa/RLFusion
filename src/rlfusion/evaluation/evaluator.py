@@ -53,7 +53,7 @@ class Evaluator:
         seed: int = 42,
         max_new_tokens: int = 1024,
         batch_size: int = 1,
-        do_sample: bool = False,
+        do_sample: bool = True,
         sampling_temperature: float = 1.0,
         log_completions: bool = False,
         max_log_chars: Optional[int] = 320,
@@ -98,6 +98,7 @@ class Evaluator:
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
 
         self._wandb = None
         if enable_wandb:
@@ -216,6 +217,7 @@ class Evaluator:
         all_completion_lengths = []
         first_env = None
         first_completions = None
+        results_path = self.output_dir / "results.jsonl"
 
         was_training = self.model.training
         self.model.eval()
@@ -227,23 +229,33 @@ class Evaluator:
             desc="Evaluating",
             disable=not self.show_progress or not sys.stderr.isatty(),
         )
-        for start in progress:
-            batch_indices = indices[start : start + self.batch_size]
-            env_batch = [self.dataset[i] for i in batch_indices]
+        with results_path.open("w", encoding="utf-8") as results_file:
+            for start in progress:
+                batch_indices = indices[start : start + self.batch_size]
+                env_batch = [self.dataset[i] for i in batch_indices]
 
-            for env in env_batch:
-                if not isinstance(env, EnvBase):
-                    raise TypeError("Dataset items must be EnvBase instances.")
+                for env in env_batch:
+                    if not isinstance(env, EnvBase):
+                        raise TypeError("Dataset items must be EnvBase instances.")
 
-            _, texts, _, completion_lens = self.sample_completions_batch(env_batch)
+                _, texts, _, completion_lens = self.sample_completions_batch(env_batch)
 
-            rewards = [self._compute_reward(env, text) for env, text in zip(env_batch, texts)]
-            all_rewards.extend(rewards)
-            all_completion_lengths.extend(completion_lens)
+                rewards = [self._compute_reward(env, text) for env, text in zip(env_batch, texts)]
+                all_rewards.extend(rewards)
+                all_completion_lengths.extend(completion_lens)
 
-            if first_completions is None:
-                first_env = env_batch[0]
-                first_completions = texts[0]
+                for env, text, reward in zip(env_batch, texts, rewards):
+                    record = {
+                        "prompt": env.prompt,
+                        "answer": env.answer,
+                        "generated_answer": text,
+                        "reward": reward,
+                    }
+                    results_file.write(json.dumps(record, default=str) + "\n")
+
+                if first_completions is None:
+                    first_env = env_batch[0]
+                    first_completions = texts[0]
 
         if was_training:
             self.model.train()
@@ -281,6 +293,9 @@ class Evaluator:
 
         if self._wandb is not None:
             self._wandb.log(metrics)
+            artifact = self._wandb.Artifact("evaluation_results", type="evaluation")
+            artifact.add_file(str(results_path))
+            self._wandb.log_artifact(artifact)
             self._wandb.finish()
 
         return metrics

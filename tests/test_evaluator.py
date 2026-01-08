@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import torch
@@ -105,6 +106,15 @@ def test_evaluator_runs_and_writes_metrics(tmp_path, monkeypatch):
     assert metrics["reward_std"] == 0.0
     assert metrics["completion_tokens_mean"] == 1.0
     assert (tmp_path / "metrics.json").exists()
+    results_path = tmp_path / "results.jsonl"
+    assert results_path.exists()
+    lines = results_path.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == len(dataset)
+    first_record = json.loads(lines[0])
+    assert first_record["prompt"] == dataset[0].prompt
+    assert first_record["answer"] is None
+    assert first_record["generated_answer"] == "completion"
+    assert first_record["reward"] == 1.0
 
 
 def test_sample_completions_batch_ignores_input_padding(monkeypatch):
