@@ -18,7 +18,8 @@ dependencies = [
     "transformers",
     "wandb",
     "datasets",
-    "regex"
+    "regex",
+    "tqdm"
 ]
 
 [project.optional-dependencies]

@@ -3,11 +3,13 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Optional, Tuple, List, cast
 
 import torch
+from tqdm import tqdm
 
 try:
     _liger = importlib.import_module("liger_kernel.transformers")
@@ -55,6 +57,7 @@ class Evaluator:
         sampling_temperature: float = 1.0,
         log_completions: bool = False,
         max_log_chars: Optional[int] = 320,
+        show_progress: bool = True,
         log_level: int = logging.INFO,
     ) -> None:
         set_seed(seed)
@@ -71,6 +74,7 @@ class Evaluator:
         self.sampling_temperature = sampling_temperature
         self.log_completions = log_completions
         self.max_log_chars = max_log_chars
+        self.show_progress = show_progress
 
         device = get_device()
         if device == "cuda":
@@ -216,7 +220,14 @@ class Evaluator:
         was_training = self.model.training
         self.model.eval()
 
-        for start in range(0, len(indices), self.batch_size):
+        total_batches = (len(indices) + self.batch_size - 1) // self.batch_size
+        progress = tqdm(
+            range(0, len(indices), self.batch_size),
+            total=total_batches,
+            desc="Evaluating",
+            disable=not self.show_progress or not sys.stderr.isatty(),
+        )
+        for start in progress:
             batch_indices = indices[start : start + self.batch_size]
             env_batch = [self.dataset[i] for i in batch_indices]
 
