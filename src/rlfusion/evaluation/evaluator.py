@@ -4,6 +4,7 @@ import importlib
 import inspect
 import json
 import logging
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -86,9 +87,10 @@ class Evaluator:
         self._vllm_sampling_params_cls = None
         self._vllm_sampling_param_keys = None
 
-        device = get_device()
+        device = "vllm"
         device_map = "vllm"
         if self.engine == "hf":
+            device = get_device()
             if device == "cuda":
                 device_map = "auto"
                 configure_torch_backends()
@@ -107,6 +109,14 @@ class Evaluator:
                 model_kwargs["dtype"] = torch.float16
             self.model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
         else:
+            if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") is None:
+                os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+                logger.info("Set VLLM_WORKER_MULTIPROC_METHOD=spawn for vLLM.")
+            elif os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
+                logger.warning(
+                    "VLLM_WORKER_MULTIPROC_METHOD=%s may fail with CUDA; prefer 'spawn'.",
+                    os.environ.get("VLLM_WORKER_MULTIPROC_METHOD"),
+                )
             vllm_args = vllm_args or {}
             try:
                 from vllm import LLM, SamplingParams
