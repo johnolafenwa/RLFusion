@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import logging
 import sys
@@ -49,6 +50,8 @@ class Evaluator:
         enable_wandb: bool = False,
         wandb_project: str = "evaluation",
         wandb_run_name: Optional[str] = None,
+        engine: str = "hf",
+        vllm_args: Optional[dict[str, Any]] = None,
         generation_args: Optional[dict[str, Any]] = None,
         seed: int = 42,
         max_new_tokens: int = 1024,
@@ -76,24 +79,47 @@ class Evaluator:
         self.max_log_chars = max_log_chars
         self.show_progress = show_progress
 
-        device = get_device()
-        if device == "cuda":
-            device_map = "auto"
-            configure_torch_backends()
-        else:
-            device_map = device
+        if engine not in {"hf", "vllm"}:
+            raise ValueError("engine must be 'hf' or 'vllm'.")
+        self.engine = engine
+        self._vllm = None
+        self._vllm_sampling_params_cls = None
+        self._vllm_sampling_param_keys = None
 
-        attn_implementation = resolve_attention_implementation(device_map)
-        model_kwargs: dict[str, Any] = {
-            "device_map": device_map,
-            "attn_implementation": attn_implementation,
-        }
-        if device == "cuda":
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            model_kwargs["dtype"] = dtype
-        elif device == "mps":
-            model_kwargs["dtype"] = torch.float16
-        self.model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
+        device = get_device()
+        device_map = "vllm"
+        if self.engine == "hf":
+            if device == "cuda":
+                device_map = "auto"
+                configure_torch_backends()
+            else:
+                device_map = device
+
+            attn_implementation = resolve_attention_implementation(device_map)
+            model_kwargs: dict[str, Any] = {
+                "device_map": device_map,
+                "attn_implementation": attn_implementation,
+            }
+            if device == "cuda":
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                model_kwargs["dtype"] = dtype
+            elif device == "mps":
+                model_kwargs["dtype"] = torch.float16
+            self.model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
+        else:
+            vllm_args = vllm_args or {}
+            try:
+                from vllm import LLM, SamplingParams
+            except Exception as exc:
+                raise ImportError(
+                    "vllm is required for engine='vllm'. Install with: uv pip install vllm"
+                ) from exc
+            self._vllm = LLM(model=model, **vllm_args)
+            self._vllm_sampling_params_cls = SamplingParams
+            self._vllm_sampling_param_keys = set(
+                inspect.signature(SamplingParams).parameters.keys()
+            )
+            self.model = None
 
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
@@ -112,6 +138,7 @@ class Evaluator:
                         "model": model,
                         "device": device,
                         "device_map": device_map,
+                        "engine": engine,
                         "output_dir": output_dir,
                         "max_new_tokens": max_new_tokens,
                         "batch_size": batch_size,
@@ -137,9 +164,86 @@ class Evaluator:
         reward_value = env.get_reward(completion_text)
         return 0.0 if reward_value is None else float(reward_value)
 
+    def _build_vllm_sampling_params(self) -> Any:
+        if self._vllm_sampling_params_cls is None:
+            raise RuntimeError("vLLM engine is not initialized.")
+        if self._vllm_sampling_param_keys is None:
+            raise RuntimeError("vLLM sampling parameters are unavailable.")
+
+        max_tokens = self.generation_args.get("max_tokens", self.max_new_tokens)
+        if "max_new_tokens" in self.generation_args and "max_tokens" not in self.generation_args:
+            max_tokens = self.generation_args["max_new_tokens"]
+
+        sampling_kwargs: dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "temperature": self.sampling_temperature if self.do_sample else 0.0,
+        }
+        for key, value in self.generation_args.items():
+            if key == "max_new_tokens":
+                continue
+            if key in self._vllm_sampling_param_keys:
+                sampling_kwargs[key] = value
+
+        return self._vllm_sampling_params_cls(**sampling_kwargs)
+
+    def _sample_completions_batch_vllm(
+        self, envs: List[EnvBase]
+    ) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
+        if self._vllm is None:
+            raise RuntimeError("vLLM engine is not initialized.")
+
+        formatted_prompts = []
+        for env in envs:
+            formatted_prompt = self.tokenizer.apply_chat_template(
+                env.prompt,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            formatted_prompts.append(formatted_prompt)
+
+        sampling_params = self._build_vllm_sampling_params()
+        outputs = self._vllm.generate(formatted_prompts, sampling_params)
+
+        ret_texts = []
+        completion_lengths = []
+        prompt_lengths = []
+        eos_token_id = self.tokenizer.eos_token_id
+
+        for output in outputs:
+            prompt_token_ids = getattr(output, "prompt_token_ids", None)
+            prompt_lengths.append(0 if prompt_token_ids is None else len(prompt_token_ids))
+
+            if not output.outputs:
+                ret_texts.append("")
+                completion_lengths.append(0)
+                continue
+
+            completion = output.outputs[0]
+            token_ids = getattr(completion, "token_ids", None)
+            if token_ids is None:
+                token_ids = self.tokenizer.encode(completion.text, add_special_tokens=False)
+            token_ids = list(token_ids)
+            end_offset = len(token_ids)
+            if eos_token_id is not None:
+                for idx, token_id in enumerate(token_ids):
+                    if token_id == eos_token_id:
+                        end_offset = idx
+                        break
+
+            completion_token_ids = token_ids[:end_offset]
+            text = self.tokenizer.decode(completion_token_ids, skip_special_tokens=True)
+            ret_texts.append(text)
+            completion_lengths.append(len(completion_token_ids))
+
+        sequences = torch.empty((len(envs), 0), dtype=torch.long)
+        return sequences, ret_texts, prompt_lengths, completion_lengths
+
     def sample_completions_batch(
         self, envs: List[EnvBase]
     ) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
+        if self.engine == "vllm":
+            return self._sample_completions_batch_vllm(envs)
+
         formatted_prompts = []
         for env in envs:
             formatted_prompt = self.tokenizer.apply_chat_template(
@@ -219,8 +323,10 @@ class Evaluator:
         first_completions = None
         results_path = self.output_dir / "results.jsonl"
 
-        was_training = self.model.training
-        self.model.eval()
+        was_training = None
+        if self.engine == "hf":
+            was_training = self.model.training
+            self.model.eval()
 
         total_batches = (len(indices) + self.batch_size - 1) // self.batch_size
         progress = tqdm(
@@ -257,7 +363,7 @@ class Evaluator:
                     first_env = env_batch[0]
                     first_completions = texts[0]
 
-        if was_training:
+        if self.engine == "hf" and was_training:
             self.model.train()
 
         rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32)

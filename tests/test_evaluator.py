@@ -1,5 +1,6 @@
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import torch
 
@@ -136,3 +137,49 @@ def test_sample_completions_batch_ignores_input_padding(monkeypatch):
     _, _, _, completion_lengths = evaluator.sample_completions_batch(dataset)
 
     assert completion_lengths == [1, 1]
+
+
+def test_evaluator_vllm_engine_uses_generation_outputs(monkeypatch):
+    class FakeSamplingParams:
+        def __init__(self, max_tokens=16, temperature=1.0, top_p=1.0, top_k=-1):
+            self.max_tokens = max_tokens
+            self.temperature = temperature
+            self.top_p = top_p
+            self.top_k = top_k
+
+    class FakeCompletionOutput:
+        def __init__(self, text, token_ids):
+            self.text = text
+            self.token_ids = token_ids
+
+    class FakeRequestOutput:
+        def __init__(self):
+            self.prompt_token_ids = [9, 8]
+            self.outputs = [FakeCompletionOutput("completion", [2, 1])]
+
+    class FakeLLM:
+        def __init__(self, model, **kwargs):
+            self.model = model
+
+        def generate(self, prompts, sampling_params):
+            return [FakeRequestOutput() for _ in prompts]
+
+    fake_vllm = ModuleType("vllm")
+    fake_vllm.LLM = FakeLLM
+    fake_vllm.SamplingParams = FakeSamplingParams
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setattr("rlfusion.evaluation.evaluator.AutoTokenizer", FakeAutoTokenizer)
+
+    dataset = [DummyEnv(prompt=[{"role": "user", "content": "Hi"}])]
+    evaluator = Evaluator(
+        model="fake",
+        dataset=dataset,
+        engine="vllm",
+        max_new_tokens=2,
+    )
+
+    _, texts, prompt_lengths, completion_lengths = evaluator.sample_completions_batch(dataset)
+
+    assert texts == ["completion"]
+    assert prompt_lengths == [2]
+    assert completion_lengths == [1]
