@@ -98,34 +98,16 @@ trainer.train()
 `GRPOTrainer` samples completions from the model, computes rewards via the environment, and optimizes a GRPO objective. It accepts `train_dataset` and optional `eval_dataset`, and exposes `test()` for evaluation.
 
 ```python
-from rlfusion.envs import EnvBase
+from rlfusion.datasets import MathDataset
 from rlfusion.trainers.grpo_trainer import GRPOTrainer
-from rlfusion.utils import get_boxed_answer
 
-
-class SimpleMathEnv(EnvBase):
-    def get_reward(self, prediction: str) -> float:
-        if self.answer is None:
-            return 0.0
-        boxed = get_boxed_answer(prediction)
-        return 1.0 if boxed == str(self.answer) else 0.0
-
-
-dataset = [
-    SimpleMathEnv(
-        prompt=[{"role": "user", "content": "What is 2 + 2?"}],
-        answer="4",
-    ),
-    SimpleMathEnv(
-        prompt=[{"role": "user", "content": "What is 3 + 5?"}],
-        answer="8",
-    ),
-]
+train_dataset = MathDataset(num_samples=200, min_val=0, max_val=50, operand="add")
+eval_dataset = MathDataset(num_samples=50, min_val=0, max_val=50, operand="add")
 
 trainer = GRPOTrainer(
     model="Qwen/Qwen2.5-0.5B-Instruct",
-    train_dataset=dataset,
-    eval_dataset=dataset,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
     num_steps=2,
     saving_steps=2,
     logging_steps=1,
@@ -140,35 +122,17 @@ trainer.train()
 `OnPolicyDistillationTrainer` samples from the student and minimizes reverse KL to a fixed teacher distribution over completion tokens. It accepts `train_dataset` and optional `eval_dataset`, and exposes `test()` for evaluation.
 
 ```python
-from rlfusion.envs import EnvBase
+from rlfusion.datasets import MathDataset
 from rlfusion.trainers.onpolicy_distillation_trainer import OnPolicyDistillationTrainer
-from rlfusion.utils import get_boxed_answer
 
-
-class SimpleMathEnv(EnvBase):
-    def get_reward(self, prediction: str) -> float:
-        if self.answer is None:
-            return 0.0
-        boxed = get_boxed_answer(prediction)
-        return 1.0 if boxed == str(self.answer) else 0.0
-
-
-dataset = [
-    SimpleMathEnv(
-        prompt=[{"role": "user", "content": "What is 2 + 2?"}],
-        answer="4",
-    ),
-    SimpleMathEnv(
-        prompt=[{"role": "user", "content": "What is 3 + 5?"}],
-        answer="8",
-    ),
-]
+train_dataset = MathDataset(num_samples=200, min_val=0, max_val=50, operand="add")
+eval_dataset = MathDataset(num_samples=50, min_val=0, max_val=50, operand="add")
 
 trainer = OnPolicyDistillationTrainer(
     model="Qwen/Qwen2.5-0.5B-Instruct",
     teacher_model="Qwen/Qwen2.5-1.5B-Instruct",
-    train_dataset=dataset,
-    eval_dataset=dataset,
+    train_dataset=train_dataset,
+    eval_dataset=eval_dataset,
     num_steps=2,
     saving_steps=2,
     logging_steps=1,

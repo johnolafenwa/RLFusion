@@ -262,10 +262,11 @@ class GRPOTrainer():
                 eos_positions = (output_token_ids[prompt_len:] == eos_token_id).nonzero(as_tuple=True)[0]
                 if eos_positions.numel() > 0:
                     end_index = prompt_len + int(eos_positions[0]) + 1
-            elif pad_token_id is not None:
+
+            if pad_token_id is not None:
                 pad_positions = (output_token_ids[prompt_len:] == pad_token_id).nonzero(as_tuple=True)[0]
                 if pad_positions.numel() > 0:
-                    end_index = prompt_len + int(pad_positions[0]) + 1
+                    end_index = min(end_index, prompt_len + int(pad_positions[0]))
 
             completion_token_ids = output_token_ids[prompt_len:end_index]
 

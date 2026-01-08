@@ -1,11 +1,16 @@
-import re
+from typing import Optional
 
-def get_boxed_answer(text: str):
-    
-    boxed_answers = re.findall(r"\[(.*?)\]", text)
+import regex as re
 
-    if len(boxed_answers) == 0:
-        return None
-    else:
-        return boxed_answers[-1]
+_BOXED_PATTERN = re.compile(
+    r"(?(DEFINE)(?P<BRACE>\{(?:[^{}]+|(?&BRACE))*\}))"
+    r"\\boxed\{(?P<content>(?:[^{}]+|(?&BRACE))*)\}"
+)
+
+
+def get_boxed_answer(text: str) -> Optional[str]:
+    last_match = None
+    for match in _BOXED_PATTERN.finditer(text):
+        last_match = match.group("content")
+    return last_match
     
