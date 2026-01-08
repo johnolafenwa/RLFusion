@@ -1446,6 +1446,7 @@ dependencies = [
     { name = "datasets" },
     { name = "regex" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "transformers" },
     { name = "wandb" },
 ]
@@ -1467,6 +1468,7 @@ requires-dist = [
     { name = "regex" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "transformers" },
     { name = "ty", marker = "extra == 'dev'" },
     { name = "wandb" },

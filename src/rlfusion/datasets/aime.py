@@ -7,14 +7,13 @@ from dataclasses import dataclass
 @dataclass
 class AimeEnv(EnvBase):
 
-    def get_reward(self, prediction) -> float:
-
+    def get_reward(self, prediction: str | None) -> float:
+        if prediction is None or self.answer is None:
+            return 0.0
         final_answer = get_boxed_answer(prediction)
-
         if final_answer is None:
             return 0.0
-        else:
-            return 1.0 if str(prediction) == str(final_answer) else 0.0
+        return 1.0 if final_answer.strip() == str(self.answer).strip() else 0.0
     
 
 class AIME2025(Dataset):
@@ -46,7 +45,6 @@ class AIME2025(Dataset):
             answer=self.dataset[index]["answer"]
         )
         
-
 
 
 
