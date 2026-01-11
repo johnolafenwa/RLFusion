@@ -1,5 +1,7 @@
 import importlib
+import inspect
 import logging
+import os
 import random
 from collections.abc import Sequence
 from pathlib import Path
@@ -49,6 +51,7 @@ class OnPolicyDistillationTrainer:
         num_steps: int = 100,
         saving_steps: int = 10,
         logging_steps: int = 10,
+        eval_steps: Optional[int] = None,
         enable_wandb: bool = False,
         wandb_project: str = "onpolicy_distill",
         wandb_run_name: Optional[str] = None,
@@ -68,6 +71,8 @@ class OnPolicyDistillationTrainer:
         max_log_chars: Optional[int] = 320,
         max_grad_norm: Optional[float] = None,
         log_level: int = logging.INFO,
+        engine: str = "hf",
+        vllm_args: Optional[dict[str, Any]] = None,
     ):
         set_seed(seed)
         self.seed = seed
@@ -88,6 +93,18 @@ class OnPolicyDistillationTrainer:
         self.log_completions = log_completions
         self.max_log_chars = max_log_chars
         self.max_grad_norm = max_grad_norm
+
+        if eval_steps is not None and eval_steps <= 0:
+            raise ValueError("eval_steps must be >= 1 or None.")
+        self.eval_steps = eval_steps
+
+        if engine not in {"hf", "vllm"}:
+            raise ValueError("engine must be 'hf' or 'vllm'.")
+        self.engine = engine
+        self._vllm = None
+        self._vllm_sampling_params_cls = None
+        self._vllm_sampling_param_keys = None
+        self._vllm_args = vllm_args or {}
 
         device = get_device()
         if device == "cuda":
@@ -123,6 +140,9 @@ class OnPolicyDistillationTrainer:
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        if self.engine == "vllm":
+            self._init_vllm_engine(model)
+
         self._wandb = None
         if enable_wandb:
             try:
@@ -136,9 +156,11 @@ class OnPolicyDistillationTrainer:
                         "teacher_model": teacher_model,
                         "device": device,
                         "device_map": device_map,
+                        "engine": engine,
                         "num_steps": num_steps,
                         "saving_steps": saving_steps,
                         "logging_steps": logging_steps,
+                        "eval_steps": eval_steps,
                         "sampling_temperature": sampling_temperature,
                         "output_dir": output_dir,
                         "optimizer": optimizer.__name__ if hasattr(optimizer, "__name__") else optimizer.__class__.__name__,
@@ -151,6 +173,7 @@ class OnPolicyDistillationTrainer:
                         "batch_size": batch_size,
                         "ppo_steps": ppo_steps,
                         "clip_eps": clip_eps,
+                        "vllm_args": self._vllm_args if self.engine == "vllm" else None,
                     },
                 )
                 self._wandb = wandb
@@ -179,9 +202,154 @@ class OnPolicyDistillationTrainer:
             )
         logger.setLevel(log_level)
 
+    def _init_vllm_engine(self, model_path: str) -> None:
+        if os.environ.get("VLLM_ATTENTION_BACKEND") is None:
+            os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+            logger.info("Set VLLM_ATTENTION_BACKEND=FLASH_ATTN for vLLM.")
+
+        if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") is None:
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+            logger.info("Set VLLM_WORKER_MULTIPROC_METHOD=spawn for vLLM.")
+        elif os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
+            logger.warning(
+                "VLLM_WORKER_MULTIPROC_METHOD=%s may fail with CUDA; prefer 'spawn'.",
+                os.environ.get("VLLM_WORKER_MULTIPROC_METHOD"),
+            )
+
+        try:
+            from vllm import LLM, SamplingParams
+        except Exception as exc:
+            raise ImportError(
+                "vllm is required for engine='vllm'. Install with: uv pip install vllm"
+            ) from exc
+
+        self._vllm = LLM(model=model_path, **self._vllm_args)
+        self._vllm_sampling_params_cls = SamplingParams
+        self._vllm_sampling_param_keys = set(
+            inspect.signature(SamplingParams).parameters.keys()
+        )
+
+    def _build_vllm_sampling_params(self) -> Any:
+        if self._vllm_sampling_params_cls is None:
+            raise RuntimeError("vLLM engine is not initialized.")
+        if self._vllm_sampling_param_keys is None:
+            raise RuntimeError("vLLM sampling parameters are unavailable.")
+
+        max_tokens = self.generation_args.get("max_tokens", self.max_new_tokens)
+        if "max_new_tokens" in self.generation_args and "max_tokens" not in self.generation_args:
+            max_tokens = self.generation_args["max_new_tokens"]
+
+        sampling_kwargs: dict[str, Any] = {
+            "max_tokens": max_tokens,
+            "temperature": self.sampling_temperature,
+        }
+        for key, value in self.generation_args.items():
+            if key == "max_new_tokens":
+                continue
+            if key in self._vllm_sampling_param_keys:
+                sampling_kwargs[key] = value
+
+        return self._vllm_sampling_params_cls(**sampling_kwargs)
+
+    def _sample_completions_batch_vllm(
+        self, envs: List[EnvBase]
+    ) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
+        if self._vllm is None:
+            raise RuntimeError("vLLM engine is not initialized.")
+
+        formatted_prompts = []
+        for env in envs:
+            formatted_prompt = self.tokenizer.apply_chat_template(
+                env.prompt,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            formatted_prompts.append(formatted_prompt)
+
+        sampling_params = self._build_vllm_sampling_params()
+        outputs = self._vllm.generate(formatted_prompts, sampling_params)
+
+        ret_texts = []
+        completion_lengths = []
+        prompt_lengths = []
+        sequences_list = []
+        eos_token_id = self.tokenizer.eos_token_id
+        pad_token_id = self.tokenizer.pad_token_id
+
+        for output, formatted_prompt in zip(outputs, formatted_prompts):
+            prompt_token_ids = getattr(output, "prompt_token_ids", None)
+            if prompt_token_ids is None:
+                prompt_token_ids = self.tokenizer.encode(formatted_prompt)
+            prompt_token_ids = list(prompt_token_ids)
+            prompt_lengths.append(len(prompt_token_ids))
+
+            completion_token_ids = []
+            completion_text = ""
+
+            if output.outputs:
+                completion = output.outputs[0]
+                token_ids = getattr(completion, "token_ids", None)
+                if token_ids is None:
+                    token_ids = self.tokenizer.encode(completion.text, add_special_tokens=False)
+                token_ids = list(token_ids)
+                end_offset = len(token_ids)
+
+                if eos_token_id is not None:
+                    for idx, token_id in enumerate(token_ids):
+                        if token_id == eos_token_id:
+                            end_offset = idx + 1
+                            break
+
+                if pad_token_id is not None:
+                    for idx, token_id in enumerate(token_ids):
+                        if token_id == pad_token_id:
+                            end_offset = min(end_offset, idx)
+                            break
+
+                completion_token_ids = token_ids[:end_offset]
+                completion_text = self.tokenizer.decode(
+                    completion_token_ids, skip_special_tokens=True
+                )
+
+            sequences_list.append(prompt_token_ids + completion_token_ids)
+            completion_lengths.append(len(completion_token_ids))
+            ret_texts.append(completion_text)
+
+        if sequences_list:
+            max_len = max(len(seq) for seq in sequences_list)
+        else:
+            max_len = 0
+
+        if max_len == 0:
+            sequences_tensor = torch.empty((len(envs), 0), dtype=torch.long)
+        else:
+            if pad_token_id is None:
+                pad_token_id = 0
+            padded = [seq + [pad_token_id] * (max_len - len(seq)) for seq in sequences_list]
+            sequences_tensor = torch.tensor(padded, dtype=torch.long)
+
+        model_device = next(self.model.parameters()).device
+        sequences_tensor = sequences_tensor.to(model_device)
+        return sequences_tensor, ret_texts, prompt_lengths, completion_lengths
+
+    def _refresh_vllm_weights(self) -> None:
+        if self.engine != "vllm":
+            return
+
+        vllm_output_dir = self.output_dir / "vllm_latest"
+        vllm_output_dir.mkdir(parents=True, exist_ok=True)
+        self.model.save_pretrained(vllm_output_dir)
+        self.tokenizer.save_pretrained(vllm_output_dir)
+
+        self._vllm = None
+        self._init_vllm_engine(str(vllm_output_dir))
+
     def sample_completions_batch(
         self, envs: List[EnvBase]
     ) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
+        if self.engine == "vllm":
+            return self._sample_completions_batch_vllm(envs)
+
         formatted_prompts = []
         for env in envs:
             formatted_prompt = self.tokenizer.apply_chat_template(
@@ -375,6 +543,8 @@ class OnPolicyDistillationTrainer:
         dataset_len = len(self.train_dataset)
         if dataset_len == 0:
             raise ValueError("Dataset is empty.")
+        if self.eval_steps is not None and self.eval_dataset is None:
+            raise ValueError("Eval dataset is required when eval_steps is set.")
 
         self.model.train()
         self.teacher_model.eval()
@@ -438,6 +608,12 @@ class OnPolicyDistillationTrainer:
                 reward_std=reward_std,
             )
 
+            if self.engine == "vllm":
+                self._refresh_vllm_weights()
+
+            if self.eval_steps is not None and step % self.eval_steps == 0:
+                self.test(log_step=step)
+
             if step % self.saving_steps == 0:
                 step_output_dir = self.output_dir / f"step_{step}"
                 step_output_dir.mkdir(parents=True, exist_ok=True)
@@ -447,7 +623,12 @@ class OnPolicyDistillationTrainer:
         if self._wandb is not None:
             self._wandb.finish()
 
-    def test(self, dataset: Optional[Sequence[Any]] = None, num_batches: Optional[int] = None) -> dict:
+    def test(
+        self,
+        dataset: Optional[Sequence[Any]] = None,
+        num_batches: Optional[int] = None,
+        log_step: Optional[int] = None,
+    ) -> dict:
         eval_dataset = dataset if dataset is not None else self.eval_dataset
         if eval_dataset is None:
             raise ValueError("Eval dataset is required for testing.")
@@ -514,8 +695,9 @@ class OnPolicyDistillationTrainer:
         if first_batch_completions is None or first_batch_env is None:
             raise ValueError("Eval dataset did not yield any batches.")
 
+        step_value = 0 if log_step is None else log_step
         self._log_step(
-            0,
+            step_value,
             first_batch_env,
             first_batch_completions,
             loss_value=float(loss.item()),

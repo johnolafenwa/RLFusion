@@ -19,7 +19,8 @@ dependencies = [
     "wandb",
     "datasets",
     "regex",
-    "tqdm"
+    "tqdm",
+    "numpy<2.3"
 ]
 
 [project.optional-dependencies]

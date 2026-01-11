@@ -24,7 +24,7 @@ class IntellectMathDataset(Dataset):
     def __init__(
         self,
         train: bool = True,
-        system_prompt: str = "Solve the problem and put the final answer in [result].",
+        system_prompt: str = "Solve the problem and return the final answer in boxed format.",
         max_samples: Optional[int] = None,
         seed: Optional[int] = None,
     ):

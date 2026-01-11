@@ -15,3 +15,8 @@ Recommended starting point:
 Notes:
 - Use a stronger teacher for better distillation signal.
 - If reverse KL is noisy, lower temperature or reduce max new tokens.
+- Set `eval_steps` and pass `eval_dataset` to run evaluation during training.
+- vLLM is supported via `engine="vllm"` and optional `vllm_args`.
+- When using vLLM, weights are refreshed each training step by saving to
+  `output_dir/vllm_latest` and re-initializing the engine.
+- RLFusion sets `VLLM_ATTENTION_BACKEND=FLASH_ATTN` when the variable is unset.

@@ -28,6 +28,18 @@ uv pip install flash-attn --no-build-isolation
 
 If FlashAttention is not available, the trainers automatically fall back to PyTorch SDPA.
 
+## vLLM (Optional)
+To use vLLM for generation in GRPO or on-policy distillation:
+
+```bash
+uv pip install vllm
+```
+
+Set `engine="vllm"` and optionally pass `vllm_args` (forwarded to `vllm.LLM`). When vLLM is
+enabled, the trainers refresh inference weights each training step by saving to
+`output_dir/vllm_latest` and re-initializing the vLLM engine. RLFusion also sets
+`VLLM_ATTENTION_BACKEND=FLASH_ATTN` when the variable is unset.
+
 ## Dev Setup
 ```bash
 uv pip install -e ".[dev,test]"
@@ -96,6 +108,7 @@ trainer.train()
 
 ### RLVR (GRPO)
 `GRPOTrainer` samples completions from the model, computes rewards via the environment, and optimizes a GRPO objective. It accepts `train_dataset` and optional `eval_dataset`, and exposes `test()` for evaluation.
+To evaluate during training, set `eval_steps` and provide `eval_dataset`.
 
 ```python
 from rlfusion.datasets import MathDataset
@@ -118,8 +131,18 @@ trainer = GRPOTrainer(
 trainer.train()
 ```
 
+To use vLLM for generation, add:
+```python
+trainer = GRPOTrainer(
+    ...,
+    engine="vllm",
+    vllm_args={"tensor_parallel_size": 1},
+)
+```
+
 ### On-policy Distillation
 `OnPolicyDistillationTrainer` samples from the student and minimizes reverse KL to a fixed teacher distribution over completion tokens. It accepts `train_dataset` and optional `eval_dataset`, and exposes `test()` for evaluation.
+To evaluate during training, set `eval_steps` and provide `eval_dataset`.
 
 ```python
 from rlfusion.datasets import MathDataset
@@ -139,6 +162,15 @@ trainer = OnPolicyDistillationTrainer(
     max_new_tokens=64,
 )
 trainer.train()
+```
+
+To use vLLM for generation, add:
+```python
+trainer = OnPolicyDistillationTrainer(
+    ...,
+    engine="vllm",
+    vllm_args={"tensor_parallel_size": 1},
+)
 ```
 
 ## Training Guides

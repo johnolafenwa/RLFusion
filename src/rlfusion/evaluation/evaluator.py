@@ -109,6 +109,9 @@ class Evaluator:
                 model_kwargs["dtype"] = torch.float16
             self.model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
         else:
+            if os.environ.get("VLLM_ATTENTION_BACKEND") is None:
+                os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
+                logger.info("Set VLLM_ATTENTION_BACKEND=FLASH_ATTN for vLLM.")
             if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") is None:
                 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
                 logger.info("Set VLLM_WORKER_MULTIPROC_METHOD=spawn for vLLM.")
