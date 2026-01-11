@@ -1,7 +1,5 @@
 import importlib
-import inspect
 import logging
-import os
 import random
 from collections.abc import Sequence
 from pathlib import Path
@@ -23,7 +21,10 @@ else:
 
 from transformers import AutoTokenizer
 
+from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.envs import EnvBase
+from rlfusion.inference.hf_utils import sample_completions_batch_hf
+from rlfusion.inference.vllm_utils import build_sampling_params, load_vllm_engine
 from rlfusion.trainers.utils import (
     get_device,
     set_seed,
@@ -32,7 +33,6 @@ from rlfusion.trainers.utils import (
     format_prompt,
     resolve_attention_implementation,
 )
-from rlfusion.trainers.types import GenerateOutput
 
 logger = logging.getLogger(__name__)
 if _USING_LIGER:
@@ -47,7 +47,6 @@ class OnPolicyDistillationTrainer:
         model: str,
         teacher_model: str,
         train_dataset: Sequence[Any],
-        eval_dataset: Optional[Sequence[Any]] = None,
         num_steps: int = 100,
         saving_steps: int = 10,
         logging_steps: int = 10,
@@ -73,13 +72,20 @@ class OnPolicyDistillationTrainer:
         log_level: int = logging.INFO,
         engine: str = "hf",
         vllm_args: Optional[dict[str, Any]] = None,
+        evaluator: Optional[Evaluator] = None,
+        use_accelerate: bool = False,
     ):
-        set_seed(seed)
+        self.accelerator = None
+        if use_accelerate:
+            from accelerate import Accelerator
+            self.accelerator = Accelerator()
+
+        seed_offset = 0 if self.accelerator is None else int(self.accelerator.process_index)
+        set_seed(seed + seed_offset)
         self.seed = seed
         self._configure_logging(log_level)
 
         self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
         self.num_steps = num_steps
         self.saving_steps = saving_steps
         self.logging_steps = logging_steps
@@ -96,7 +102,10 @@ class OnPolicyDistillationTrainer:
 
         if eval_steps is not None and eval_steps <= 0:
             raise ValueError("eval_steps must be >= 1 or None.")
+        if eval_steps is not None and evaluator is None:
+            raise ValueError("evaluator is required when eval_steps is set.")
         self.eval_steps = eval_steps
+        self.evaluator = evaluator
 
         if engine not in {"hf", "vllm"}:
             raise ValueError("engine must be 'hf' or 'vllm'.")
@@ -117,20 +126,21 @@ class OnPolicyDistillationTrainer:
         self.device_map = device_map
 
         attn_implementation = resolve_attention_implementation(device_map)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model,
-            device_map=device_map,
-            attn_implementation=attn_implementation,
-            dtype=torch.bfloat16,
-        )
+        model_kwargs: dict[str, Any] = {
+            "device_map": device_map,
+            "attn_implementation": attn_implementation,
+        }
+        if device == "cuda" and torch.cuda.is_available():
+            model_kwargs["dtype"] = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
+        elif device == "mps":
+            model_kwargs["dtype"] = torch.float16
+
+        self.model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
         self.model.config.use_cache = False
 
-        self.teacher_model = AutoModelForCausalLM.from_pretrained(
-            teacher_model,
-            device_map=device_map,
-            attn_implementation=attn_implementation,
-            dtype=torch.bfloat16,
-        )
+        self.teacher_model = AutoModelForCausalLM.from_pretrained(teacher_model, **model_kwargs)
         self.teacher_model.config.use_cache = False
         self.teacher_model.eval()
         for param in self.teacher_model.parameters():
@@ -139,12 +149,13 @@ class OnPolicyDistillationTrainer:
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
 
         if self.engine == "vllm":
             self._init_vllm_engine(model)
 
         self._wandb = None
-        if enable_wandb:
+        if enable_wandb and self._is_main_process():
             try:
                 import wandb
 
@@ -174,6 +185,7 @@ class OnPolicyDistillationTrainer:
                         "ppo_steps": ppo_steps,
                         "clip_eps": clip_eps,
                         "vllm_args": self._vllm_args if self.engine == "vllm" else None,
+                        "use_evaluator": evaluator is not None,
                     },
                 )
                 self._wandb = wandb
@@ -192,6 +204,14 @@ class OnPolicyDistillationTrainer:
                 lr_scheduler_args = {}
             self.lr_scheduler = lr_scheduler(self.optimizer, **lr_scheduler_args)
 
+        if self.accelerator is not None:
+            if self.lr_scheduler is None:
+                self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+            else:
+                self.model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
+                    self.model, self.optimizer, self.lr_scheduler
+                )
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _configure_logging(self, log_level: int) -> None:
@@ -202,31 +222,53 @@ class OnPolicyDistillationTrainer:
             )
         logger.setLevel(log_level)
 
+    def _is_main_process(self) -> bool:
+        return self.accelerator is None or bool(self.accelerator.is_main_process)
+
+    def _unwrap_model_for_saving(self) -> torch.nn.Module:
+        if self.accelerator is None:
+            return self.model
+        return cast(torch.nn.Module, self.accelerator.unwrap_model(self.model))
+
+    def _evaluate_with_evaluator(self, step: int) -> dict[str, float]:
+        if self.evaluator is None:
+            raise RuntimeError("Evaluator is not set.")
+
+        if self.evaluator.engine == "hf":
+            metrics: dict[str, float] = {}
+            if self._is_main_process():
+                model = cast(Any, self._unwrap_model_for_saving())
+                metrics = self.evaluator.evaluate_with_model(
+                    model=model, tokenizer=self.evaluator.tokenizer
+                )
+            if self.accelerator is not None:
+                self.accelerator.wait_for_everyone()
+            if not self._is_main_process():
+                return {}
+        else:
+            model_dir = self.output_dir / "eval_latest"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            if self._is_main_process():
+                model = cast(Any, self._unwrap_model_for_saving())
+                model.save_pretrained(model_dir)
+                self.tokenizer.save_pretrained(model_dir)
+            if self.accelerator is not None:
+                self.accelerator.wait_for_everyone()
+
+            if not self._is_main_process():
+                return {}
+
+            self.evaluator.set_model(str(model_dir))
+            metrics = self.evaluator.evaluate()
+
+        if self._wandb is not None:
+            self._wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=step)
+
+        return metrics
+
     def _init_vllm_engine(self, model_path: str) -> None:
-        if os.environ.get("VLLM_ATTENTION_BACKEND") is None:
-            os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
-            logger.info("Set VLLM_ATTENTION_BACKEND=FLASH_ATTN for vLLM.")
-
-        if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") is None:
-            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-            logger.info("Set VLLM_WORKER_MULTIPROC_METHOD=spawn for vLLM.")
-        elif os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
-            logger.warning(
-                "VLLM_WORKER_MULTIPROC_METHOD=%s may fail with CUDA; prefer 'spawn'.",
-                os.environ.get("VLLM_WORKER_MULTIPROC_METHOD"),
-            )
-
-        try:
-            from vllm import LLM, SamplingParams
-        except Exception as exc:
-            raise ImportError(
-                "vllm is required for engine='vllm'. Install with: uv pip install vllm"
-            ) from exc
-
-        self._vllm = LLM(model=model_path, **self._vllm_args)
-        self._vllm_sampling_params_cls = SamplingParams
-        self._vllm_sampling_param_keys = set(
-            inspect.signature(SamplingParams).parameters.keys()
+        self._vllm, self._vllm_sampling_params_cls, self._vllm_sampling_param_keys = (
+            load_vllm_engine(model_path, self._vllm_args)
         )
 
     def _build_vllm_sampling_params(self) -> Any:
@@ -234,22 +276,14 @@ class OnPolicyDistillationTrainer:
             raise RuntimeError("vLLM engine is not initialized.")
         if self._vllm_sampling_param_keys is None:
             raise RuntimeError("vLLM sampling parameters are unavailable.")
-
-        max_tokens = self.generation_args.get("max_tokens", self.max_new_tokens)
-        if "max_new_tokens" in self.generation_args and "max_tokens" not in self.generation_args:
-            max_tokens = self.generation_args["max_new_tokens"]
-
-        sampling_kwargs: dict[str, Any] = {
-            "max_tokens": max_tokens,
-            "temperature": self.sampling_temperature,
-        }
-        for key, value in self.generation_args.items():
-            if key == "max_new_tokens":
-                continue
-            if key in self._vllm_sampling_param_keys:
-                sampling_kwargs[key] = value
-
-        return self._vllm_sampling_params_cls(**sampling_kwargs)
+        return build_sampling_params(
+            self._vllm_sampling_params_cls,
+            self._vllm_sampling_param_keys,
+            generation_args=self.generation_args,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=True,
+            temperature=self.sampling_temperature,
+        )
 
     def _sample_completions_batch_vllm(
         self, envs: List[EnvBase]
@@ -276,11 +310,8 @@ class OnPolicyDistillationTrainer:
         eos_token_id = self.tokenizer.eos_token_id
         pad_token_id = self.tokenizer.pad_token_id
 
-        for output, formatted_prompt in zip(outputs, formatted_prompts):
-            prompt_token_ids = getattr(output, "prompt_token_ids", None)
-            if prompt_token_ids is None:
-                prompt_token_ids = self.tokenizer.encode(formatted_prompt)
-            prompt_token_ids = list(prompt_token_ids)
+        for output in outputs:
+            prompt_token_ids = list(output.prompt_token_ids)
             prompt_lengths.append(len(prompt_token_ids))
 
             completion_token_ids = []
@@ -338,8 +369,12 @@ class OnPolicyDistillationTrainer:
 
         vllm_output_dir = self.output_dir / "vllm_latest"
         vllm_output_dir.mkdir(parents=True, exist_ok=True)
-        self.model.save_pretrained(vllm_output_dir)
-        self.tokenizer.save_pretrained(vllm_output_dir)
+        if self._is_main_process():
+            model = cast(Any, self._unwrap_model_for_saving())
+            model.save_pretrained(vllm_output_dir)
+            self.tokenizer.save_pretrained(vllm_output_dir)
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
 
         self._vllm = None
         self._init_vllm_engine(str(vllm_output_dir))
@@ -349,67 +384,16 @@ class OnPolicyDistillationTrainer:
     ) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
         if self.engine == "vllm":
             return self._sample_completions_batch_vllm(envs)
-
-        formatted_prompts = []
-        for env in envs:
-            formatted_prompt = self.tokenizer.apply_chat_template(
-                env.prompt,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-            formatted_prompts.append(formatted_prompt)
-
-        input_tokens = self.tokenizer(formatted_prompts, return_tensors="pt", padding=True)
-        model_device = next(self.model.parameters()).device
-        input_tokens = input_tokens.to(model_device)
-
-        input_ids = input_tokens["input_ids"]
-        attention_mask = input_tokens["attention_mask"]
-        prompt_lengths = attention_mask.sum(dim=1).tolist()
-
-        gen_kwargs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "do_sample": True,
-            "temperature": self.sampling_temperature,
-            "max_new_tokens": self.max_new_tokens,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "return_dict_in_generate": True,
-            "output_scores": False,
-            "use_cache": False,
-        }
-        if self.generation_args:
-            gen_kwargs.update(self.generation_args)
-        gen_kwargs["return_dict_in_generate"] = True
-
-        outputs = cast(GenerateOutput, self.model.generate(**gen_kwargs))
-
-        generated_sequences = outputs.sequences
-        ret_texts = []
-        completion_lengths = []
-        eos_token_id = self.tokenizer.eos_token_id
-        pad_token_id = self.tokenizer.pad_token_id
-
-        for i, prompt_len in enumerate(prompt_lengths):
-            output_token_ids = generated_sequences[i]
-            end_index = output_token_ids.shape[0]
-
-            if eos_token_id is not None:
-                eos_positions = (output_token_ids[prompt_len:] == eos_token_id).nonzero(as_tuple=True)[0]
-                if eos_positions.numel() > 0:
-                    end_index = prompt_len + int(eos_positions[0]) + 1
-
-            if pad_token_id is not None:
-                pad_positions = (output_token_ids[prompt_len:] == pad_token_id).nonzero(as_tuple=True)[0]
-                if pad_positions.numel() > 0:
-                    end_index = min(end_index, prompt_len + int(pad_positions[0]))
-
-            completion_token_ids = output_token_ids[prompt_len:end_index]
-            text = self.tokenizer.decode(completion_token_ids, skip_special_tokens=True)
-            ret_texts.append(text)
-            completion_lengths.append(max(end_index - prompt_len, 0))
-
-        return generated_sequences, ret_texts, prompt_lengths, completion_lengths
+        model = cast(Any, self.model)
+        return sample_completions_batch_hf(
+            model=model,
+            tokenizer=self.tokenizer,
+            envs=envs,
+            do_sample=True,
+            sampling_temperature=self.sampling_temperature,
+            max_new_tokens=self.max_new_tokens,
+            generation_args=self.generation_args,
+        )
 
     def get_log_probs(self, sequence_ids: torch.Tensor, model: Optional[torch.nn.Module] = None) -> torch.Tensor:
         if sequence_ids.ndim == 1:
@@ -521,15 +505,15 @@ class OnPolicyDistillationTrainer:
 
         if self._wandb is not None:
             metrics = {
-                "loss": loss_value,
-                "reverse_kl": kl_value,
-                "mask_tokens_mean": mask_tokens_mean,
-                "completion_tokens_mean": completion_tokens_mean,
+                "train/loss": loss_value,
+                "train/reverse_kl": kl_value,
+                "train/mask_tokens_mean": mask_tokens_mean,
+                "train/completion_tokens_mean": completion_tokens_mean,
                 "lr": self.optimizer.param_groups[0]["lr"],
             }
             if reward_mean is not None and reward_std is not None:
-                metrics["reward/mean"] = reward_mean
-                metrics["reward/std"] = reward_std
+                metrics["train/reward_mean"] = reward_mean
+                metrics["train/reward_std"] = reward_std
             self._wandb.log(metrics, step=step)
 
     def _compute_reward(self, env: EnvBase, completion_text: Optional[str]) -> Optional[float]:
@@ -543,8 +527,8 @@ class OnPolicyDistillationTrainer:
         dataset_len = len(self.train_dataset)
         if dataset_len == 0:
             raise ValueError("Dataset is empty.")
-        if self.eval_steps is not None and self.eval_dataset is None:
-            raise ValueError("Eval dataset is required when eval_steps is set.")
+        if self.eval_steps is not None and self.evaluator is None:
+            raise ValueError("evaluator is required when eval_steps is set.")
 
         self.model.train()
         self.teacher_model.eval()
@@ -574,12 +558,16 @@ class OnPolicyDistillationTrainer:
                     clip_eps=self.clip_eps,
                 )
                 loss = loss_per.mean()
-                loss.backward()
+                if self.accelerator is None:
+                    loss.backward()
+                else:
+                    self.accelerator.backward(loss)
                 if self.max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.step()
+
+            if self.lr_scheduler is not None:
+                self.lr_scheduler.step()
 
             reverse_kl_mean = float((reverse_kl.sum(dim=1) / mask_counts).mean().item())
 
@@ -596,29 +584,45 @@ class OnPolicyDistillationTrainer:
                 reward_mean = None
                 reward_std = None
 
-            self._log_step(
-                step,
-                env_batch[0],
-                texts,
-                loss_value=float(loss.item() if loss is not None else 0.0),
-                kl_value=reverse_kl_mean,
-                mask_tokens_mean=float(mask_counts.mean().item()),
-                completion_tokens_mean=float(torch.tensor(completion_lens, dtype=torch.float32).mean().item()),
-                reward_mean=reward_mean,
-                reward_std=reward_std,
-            )
+            if (step + 1) % self.logging_steps == 0 and self._is_main_process():
+                self._log_step(
+                    step + 1,
+                    env_batch[0],
+                    texts,
+                    loss_value=float(loss.item() if loss is not None else 0.0),
+                    kl_value=reverse_kl_mean,
+                    mask_tokens_mean=float(mask_counts.mean().item()),
+                    completion_tokens_mean=float(torch.tensor(completion_lens, dtype=torch.float32).mean().item()),
+                    reward_mean=reward_mean,
+                    reward_std=reward_std,
+                )
 
             if self.engine == "vllm":
                 self._refresh_vllm_weights()
 
-            if self.eval_steps is not None and step % self.eval_steps == 0:
-                self.test(log_step=step)
+            if self.eval_steps is not None and (step + 1) % self.eval_steps == 0:
+                self._evaluate_with_evaluator(step=step + 1)
 
-            if step % self.saving_steps == 0:
-                step_output_dir = self.output_dir / f"step_{step}"
+            if (step + 1) % self.saving_steps == 0:
+                step_output_dir = self.output_dir / f"step_{step + 1}"
                 step_output_dir.mkdir(parents=True, exist_ok=True)
-                self.model.save_pretrained(step_output_dir)
-                self.tokenizer.save_pretrained(step_output_dir)
+                if self._is_main_process():
+                    model = cast(Any, self._unwrap_model_for_saving())
+                    model.save_pretrained(step_output_dir)
+                    self.tokenizer.save_pretrained(step_output_dir)
+                if self.accelerator is not None:
+                    self.accelerator.wait_for_everyone()
+
+        # Save final model
+        final_output_dir = self.output_dir / "final"
+        final_output_dir.mkdir(parents=True, exist_ok=True)
+        if self._is_main_process():
+            model = cast(Any, self._unwrap_model_for_saving())
+            model.save_pretrained(final_output_dir)
+            self.tokenizer.save_pretrained(final_output_dir)
+            logger.info("Saved final model to %s", final_output_dir)
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
 
         if self._wandb is not None:
             self._wandb.finish()
@@ -627,94 +631,129 @@ class OnPolicyDistillationTrainer:
         self,
         dataset: Optional[Sequence[Any]] = None,
         num_batches: Optional[int] = None,
-        log_step: Optional[int] = None,
+        step: Optional[int] = None,
+        eval_temperature: Optional[float] = None,
     ) -> dict:
-        eval_dataset = dataset if dataset is not None else self.eval_dataset
-        if eval_dataset is None:
-            raise ValueError("Eval dataset is required for testing.")
+        if dataset is None:
+            raise ValueError("dataset is required for testing.")
+        eval_dataset = dataset
         dataset_len = len(eval_dataset)
         if dataset_len == 0:
             raise ValueError("Eval dataset is empty.")
 
+        # Save original temperature and set eval temperature
+        original_temperature = self.sampling_temperature
+        if eval_temperature is not None:
+            self.sampling_temperature = eval_temperature
+
         self.model.eval()
         self.teacher_model.eval()
 
-        all_loss = []
-        all_mask_counts = []
-        all_completion_lengths = []
-        all_rewards = []
-        first_batch_completions: Optional[List[str]] = None
-        first_batch_env: Optional[EnvBase] = None
+        try:
+            all_loss = []
+            all_mask_counts = []
+            all_completion_lengths = []
+            all_rewards = []
+            first_batch_completions: Optional[List[str]] = None
+            first_batch_env: Optional[EnvBase] = None
 
-        if num_batches is None:
-            indices = list(range(dataset_len))
-        else:
-            indices = [random.randint(0, dataset_len - 1) for _ in range(num_batches * self.batch_size)]
+            if num_batches is None:
+                indices = list(range(dataset_len))
+            else:
+                indices = [random.randint(0, dataset_len - 1) for _ in range(num_batches * self.batch_size)]
 
-        for start in range(0, len(indices), self.batch_size):
-            batch_indices = indices[start : start + self.batch_size]
-            env_batch = [eval_dataset[i] for i in batch_indices]
+            for start in range(0, len(indices), self.batch_size):
+                batch_indices = indices[start : start + self.batch_size]
+                env_batch = [eval_dataset[i] for i in batch_indices]
 
-            with torch.no_grad():
-                sequences, texts, prompt_lens, completion_lens = self.sample_completions_batch(env_batch)
-                student_log_probs = self.get_log_probs(sequences)
-                teacher_log_probs = self.get_log_probs(sequences, model=self.teacher_model)
+                with torch.no_grad():
+                    sequences, texts, prompt_lens, completion_lens = self.sample_completions_batch(env_batch)
+                    student_log_probs = self.get_log_probs(sequences)
+                    teacher_log_probs = self.get_log_probs(sequences, model=self.teacher_model)
 
-            masks = self._build_masks(prompt_lens, completion_lens, sequences)
-            mask_counts = masks.sum(dim=1).clamp_min(1.0)
-            reverse_kl = (student_log_probs - teacher_log_probs) * masks
-            loss_per = reverse_kl.sum(dim=1) / mask_counts
+                masks = self._build_masks(prompt_lens, completion_lens, sequences)
+                mask_counts = masks.sum(dim=1).clamp_min(1.0)
+                reverse_kl = (student_log_probs - teacher_log_probs) * masks
+                loss_per = reverse_kl.sum(dim=1) / mask_counts
 
-            all_loss.extend(loss_per.detach().cpu().tolist())
-            all_mask_counts.extend(mask_counts.detach().cpu().tolist())
-            all_completion_lengths.extend(completion_lens)
+                all_loss.extend(loss_per.detach().cpu().tolist())
+                all_mask_counts.extend(mask_counts.detach().cpu().tolist())
+                all_completion_lengths.extend(completion_lens)
 
-            rewards = [
-                self._compute_reward(env, completion)
-                for env, completion in zip(env_batch, texts)
-            ]
-            all_rewards.extend([r for r in rewards if r is not None])
+                rewards = [
+                    self._compute_reward(env, completion)
+                    for env, completion in zip(env_batch, texts)
+                ]
+                all_rewards.extend([r for r in rewards if r is not None])
 
-            if first_batch_completions is None:
-                first_batch_completions = texts
-                first_batch_env = env_batch[0]
+                if first_batch_completions is None:
+                    first_batch_completions = texts
+                    first_batch_env = env_batch[0]
 
-        loss_tensor = torch.tensor(all_loss, dtype=torch.float32)
-        loss = loss_tensor.mean()
-        if all_rewards:
-            rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32)
-            reward_mean = float(rewards_tensor.mean().item())
-            reward_std = float(rewards_tensor.std(unbiased=False).item())
-        else:
-            reward_mean = None
-            reward_std = None
+            loss_tensor = torch.tensor(all_loss, dtype=torch.float32)
+            loss_mean = float(loss_tensor.mean().item())
+            if all_rewards:
+                rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32)
+                reward_mean = float(rewards_tensor.mean().item())
+                reward_std = float(rewards_tensor.std(unbiased=False).item())
+            else:
+                reward_mean = None
+                reward_std = None
 
-        mask_tokens_mean = float(torch.tensor(all_mask_counts, dtype=torch.float32).mean().item())
-        completion_tokens_mean = float(torch.tensor(all_completion_lengths, dtype=torch.float32).mean().item())
+            mask_tokens_mean = float(torch.tensor(all_mask_counts, dtype=torch.float32).mean().item())
+            completion_tokens_mean = float(torch.tensor(all_completion_lengths, dtype=torch.float32).mean().item())
 
-        if first_batch_completions is None or first_batch_env is None:
-            raise ValueError("Eval dataset did not yield any batches.")
+            # Log eval results
+            if reward_mean is None or reward_std is None:
+                logger.info(
+                    "eval loss=%.6f reverse_kl=%.6f mask_tokens_mean=%.1f completion_tokens_mean=%.1f",
+                    loss_mean,
+                    loss_mean,
+                    mask_tokens_mean,
+                    completion_tokens_mean,
+                )
+            else:
+                logger.info(
+                    "eval loss=%.6f reverse_kl=%.6f reward_mean=%.4f reward_std=%.4f",
+                    loss_mean,
+                    loss_mean,
+                    reward_mean,
+                    reward_std,
+                )
 
-        step_value = 0 if log_step is None else log_step
-        self._log_step(
-            step_value,
-            first_batch_env,
-            first_batch_completions,
-            loss_value=float(loss.item()),
-            kl_value=float(loss_tensor.mean().item()),
-            mask_tokens_mean=mask_tokens_mean,
-            completion_tokens_mean=completion_tokens_mean,
-            reward_mean=reward_mean,
-            reward_std=reward_std,
-        )
+            if self.log_completions and first_batch_completions is not None and first_batch_env is not None:
+                prompt_text = format_prompt(first_batch_env.prompt)
+                logger.info("prompt: %s", truncate_text(prompt_text, self.max_log_chars))
+                answer_text = None if first_batch_env.answer is None else str(first_batch_env.answer)
+                logger.info("gt_answer: %s", truncate_text(answer_text, self.max_log_chars))
+                for idx, completion in enumerate(first_batch_completions):
+                    completion_preview = truncate_text(completion, self.max_log_chars)
+                    logger.info("generated_%d: %s", idx, completion_preview)
 
-        self.model.train()
+            if self._wandb is not None:
+                log_data: dict[str, Any] = {
+                    "eval/loss": loss_mean,
+                    "eval/reverse_kl": loss_mean,
+                    "eval/mask_tokens_mean": mask_tokens_mean,
+                    "eval/completion_tokens_mean": completion_tokens_mean,
+                }
+                if reward_mean is not None and reward_std is not None:
+                    log_data["eval/reward_mean"] = reward_mean
+                    log_data["eval/reward_std"] = reward_std
+                if step is not None:
+                    self._wandb.log(log_data, step=step)
+                else:
+                    self._wandb.log(log_data)
 
-        return {
-            "loss": float(loss.item()),
-            "reverse_kl": float(loss_tensor.mean().item()),
-            "reward_mean": reward_mean,
-            "reward_std": reward_std,
-            "mask_tokens_mean": mask_tokens_mean,
-            "completion_tokens_mean": completion_tokens_mean,
-        }
+            return {
+                "loss": loss_mean,
+                "reverse_kl": loss_mean,
+                "reward_mean": reward_mean,
+                "reward_std": reward_std,
+                "mask_tokens_mean": mask_tokens_mean,
+                "completion_tokens_mean": completion_tokens_mean,
+            }
+        finally:
+            # Restore original temperature and model state
+            self.sampling_temperature = original_temperature
+            self.model.train()

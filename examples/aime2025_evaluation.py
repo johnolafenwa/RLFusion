@@ -11,6 +11,7 @@ def main() -> None:
         model="Qwen/Qwen3-0.6B",
         dataset=dataset,
         output_dir="./outputs/aime2025_eval",
+        num_batches=1,
         batch_size=3,
         max_new_tokens=2048,
         do_sample=False,
@@ -20,7 +21,7 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
-    evaluator.evaluate(num_batches=1)
+    evaluator.evaluate()
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 Minimalist post-training utilities for LLMs with a focus on clarity and speed.
 
 ## Features
-- SFT with role-aware masking (mask user tokens, train everything else)
+- SFT with role-aware masking (mask non-assistant tokens, train assistant tokens)
 - RLVR with GRPO
 - On-policy distillation (reverse KL to a teacher on student samples)
 - Simple `EnvBase` for prompts + answers
@@ -48,6 +48,21 @@ uv pip install -e ".[dev,test]"
 ## Quickstart
 Minimal, inline examples for each trainer are included below.
 
+## Distributed Training (Accelerate)
+All trainers support multi-GPU distributed training via Hugging Face Accelerate.
+
+1) Set `use_accelerate=True` on `SFTTrainer`, `GRPOTrainer`, or `OnPolicyDistillationTrainer`.
+2) Launch your script with Accelerate:
+
+```bash
+accelerate launch --num_processes 2 your_script.py
+```
+
+Notes:
+- `batch_size` is per-process; effective batch size is `batch_size * num_processes`.
+- Logging, evaluation, and checkpoint saving are handled on the main process (rank 0).
+- vLLM generation runs per process (typically 1 GPU per process under Accelerate).
+
 ## Core Concepts
 ### Environment
 `EnvBase` represents a single sample with a chat-style prompt and an optional answer.
@@ -66,7 +81,7 @@ env = EnvBase(
 
 ## Trainers
 ### SFT
-`SFTTrainer` consumes `(prompt, answer)` and masks any `user`-role tokens while training all other tokens. It accepts `train_dataset` and optional `eval_dataset`, and exposes `test()` for evaluation.
+`SFTTrainer` consumes `(prompt, answer)` and masks non-assistant tokens while training assistant tokens. To evaluate during training, set `eval_steps` and pass an `Evaluator`.
 
 ```python
 from torch.utils.data import Dataset
@@ -97,7 +112,6 @@ class ToySFTDataset(Dataset):
 trainer = SFTTrainer(
     model="Qwen/Qwen2.5-0.5B-Instruct",
     train_dataset=ToySFTDataset(),
-    eval_dataset=ToySFTDataset(),
     num_steps=2,
     batch_size=1,
     saving_steps=2,
@@ -107,23 +121,30 @@ trainer.train()
 ```
 
 ### RLVR (GRPO)
-`GRPOTrainer` samples completions from the model, computes rewards via the environment, and optimizes a GRPO objective. It accepts `train_dataset` and optional `eval_dataset`, and exposes `test()` for evaluation.
-To evaluate during training, set `eval_steps` and provide `eval_dataset`.
+`GRPOTrainer` samples completions from the model, computes rewards via the environment, and optimizes a GRPO objective. To evaluate during training, set `eval_steps` and pass an `Evaluator`.
 
 ```python
 from rlfusion.datasets import MathDataset
+from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.trainers.grpo_trainer import GRPOTrainer
 
 train_dataset = MathDataset(num_samples=200, min_val=0, max_val=50, operand="add")
 eval_dataset = MathDataset(num_samples=50, min_val=0, max_val=50, operand="add")
+evaluator = Evaluator(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    dataset=eval_dataset,
+    output_dir="./outputs/grpo_eval",
+    num_batches=1,
+)
 
 trainer = GRPOTrainer(
     model="Qwen/Qwen2.5-0.5B-Instruct",
     train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
     num_steps=2,
     saving_steps=2,
     logging_steps=1,
+    eval_steps=1,
+    evaluator=evaluator,
     group_size=2,
     ppo_steps=1,
     max_new_tokens=64,
@@ -141,24 +162,31 @@ trainer = GRPOTrainer(
 ```
 
 ### On-policy Distillation
-`OnPolicyDistillationTrainer` samples from the student and minimizes reverse KL to a fixed teacher distribution over completion tokens. It accepts `train_dataset` and optional `eval_dataset`, and exposes `test()` for evaluation.
-To evaluate during training, set `eval_steps` and provide `eval_dataset`.
+`OnPolicyDistillationTrainer` samples from the student and minimizes reverse KL to a fixed teacher distribution over completion tokens. To evaluate during training, set `eval_steps` and pass an `Evaluator`.
 
 ```python
 from rlfusion.datasets import MathDataset
+from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.trainers.onpolicy_distillation_trainer import OnPolicyDistillationTrainer
 
 train_dataset = MathDataset(num_samples=200, min_val=0, max_val=50, operand="add")
 eval_dataset = MathDataset(num_samples=50, min_val=0, max_val=50, operand="add")
+evaluator = Evaluator(
+    model="Qwen/Qwen2.5-0.5B-Instruct",
+    dataset=eval_dataset,
+    output_dir="./outputs/onpolicy_eval",
+    num_batches=1,
+)
 
 trainer = OnPolicyDistillationTrainer(
     model="Qwen/Qwen2.5-0.5B-Instruct",
     teacher_model="Qwen/Qwen2.5-1.5B-Instruct",
     train_dataset=train_dataset,
-    eval_dataset=eval_dataset,
     num_steps=2,
     saving_steps=2,
     logging_steps=1,
+    eval_steps=1,
+    evaluator=evaluator,
     max_new_tokens=64,
 )
 trainer.train()

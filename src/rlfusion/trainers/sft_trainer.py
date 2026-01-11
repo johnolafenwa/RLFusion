@@ -3,7 +3,7 @@ import logging
 import random
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional, Iterable, Tuple, Any
+from typing import Optional, Iterable, Tuple, Any, Literal, cast
 
 import torch
 from torch.optim import Optimizer, AdamW
@@ -20,6 +20,7 @@ else:
 
 from transformers import AutoTokenizer
 
+from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.trainers.utils import get_device, set_seed, configure_torch_backends, resolve_attention_implementation
 
 logger = logging.getLogger(__name__)
@@ -34,11 +35,11 @@ class SFTTrainer:
         self,
         model: str,
         train_dataset: Sequence[Any],
-        eval_dataset: Optional[Sequence[Any]] = None,
         num_steps: int = 100,
         batch_size: int = 8,
         saving_steps: int = 10,
         logging_steps: int = 10,
+        eval_steps: Optional[int] = None,
         enable_wandb: bool = False,
         wandb_project: str = "sft",
         wandb_run_name: Optional[str] = None,
@@ -50,15 +51,23 @@ class SFTTrainer:
         seed: int = 42,
         max_seq_len: Optional[int] = None,
         mask_prompt: bool = True,
+        assistant_loss_mode: Literal["all", "last"] = "all",
         max_grad_norm: Optional[float] = None,
         log_level: int = logging.INFO,
+        evaluator: Optional[Evaluator] = None,
+        use_accelerate: bool = False,
     ):
-        set_seed(seed)
+        self.accelerator = None
+        if use_accelerate:
+            from accelerate import Accelerator
+            self.accelerator = Accelerator()
+
+        seed_offset = 0 if self.accelerator is None else int(self.accelerator.process_index)
+        set_seed(seed + seed_offset)
         self.seed = seed
         self._configure_logging(log_level)
 
         self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
         self.num_steps = num_steps
         self.batch_size = batch_size
         self.saving_steps = saving_steps
@@ -66,7 +75,17 @@ class SFTTrainer:
         self.output_dir = Path(output_dir)
         self.max_seq_len = max_seq_len
         self.mask_prompt = mask_prompt
+        if assistant_loss_mode not in {"all", "last"}:
+            raise ValueError("assistant_loss_mode must be 'all' or 'last'.")
+        self.assistant_loss_mode: Literal["all", "last"] = assistant_loss_mode
         self.max_grad_norm = max_grad_norm
+
+        if eval_steps is not None and eval_steps <= 0:
+            raise ValueError("eval_steps must be >= 1 or None.")
+        if eval_steps is not None and evaluator is None:
+            raise ValueError("evaluator is required when eval_steps is set.")
+        self.eval_steps = eval_steps
+        self.evaluator = evaluator
 
         device = get_device()
         if device == "cuda":
@@ -79,11 +98,19 @@ class SFTTrainer:
         self.device_map = device_map
 
         attn_implementation = resolve_attention_implementation(device_map)
+        model_kwargs: dict[str, Any] = {
+            "device_map": device_map,
+            "attn_implementation": attn_implementation,
+        }
+        if device == "cuda":
+            model_kwargs["dtype"] = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
+        elif device == "mps":
+            model_kwargs["dtype"] = torch.float16
         self.model = AutoModelForCausalLM.from_pretrained(
             model,
-            device_map=device_map,
-            attn_implementation=attn_implementation,
-            dtype=torch.bfloat16,
+            **model_kwargs,
         )
         self.model.config.use_cache = False
 
@@ -92,7 +119,10 @@ class SFTTrainer:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self._wandb = None
-        if enable_wandb:
+        should_enable_wandb = enable_wandb and (
+            self.accelerator is None or self.accelerator.is_main_process
+        )
+        if should_enable_wandb:
             try:
                 import wandb
 
@@ -107,6 +137,7 @@ class SFTTrainer:
                         "batch_size": batch_size,
                         "saving_steps": saving_steps,
                         "logging_steps": logging_steps,
+                        "eval_steps": eval_steps,
                         "output_dir": output_dir,
                         "optimizer": optimizer.__name__ if hasattr(optimizer, "__name__") else optimizer.__class__.__name__,
                         "optimizer_args": optimizer_args,
@@ -116,6 +147,8 @@ class SFTTrainer:
                         "seed": seed,
                         "max_seq_len": max_seq_len,
                         "mask_prompt": mask_prompt,
+                        "assistant_loss_mode": assistant_loss_mode,
+                        "use_evaluator": evaluator is not None,
                     },
                 )
                 self._wandb = wandb
@@ -134,6 +167,14 @@ class SFTTrainer:
                 lr_scheduler_args = {}
             self.lr_scheduler = lr_scheduler(self.optimizer, **lr_scheduler_args)
 
+        if self.accelerator is not None:
+            if self.lr_scheduler is None:
+                self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+            else:
+                self.model, self.optimizer, self.lr_scheduler = self.accelerator.prepare(
+                    self.model, self.optimizer, self.lr_scheduler
+                )
+
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _configure_logging(self, log_level: int) -> None:
@@ -143,6 +184,50 @@ class SFTTrainer:
                 format="%(asctime)s %(levelname)s %(name)s: %(message)s",
             )
         logger.setLevel(log_level)
+
+    def _is_main_process(self) -> bool:
+        return self.accelerator is None or bool(self.accelerator.is_main_process)
+
+    def _unwrap_model_for_saving(self) -> torch.nn.Module:
+        if self.accelerator is None:
+            return self.model
+        return cast(torch.nn.Module, self.accelerator.unwrap_model(self.model))
+
+    def _evaluate_with_evaluator(self, step: int) -> dict[str, float]:
+        if self.evaluator is None:
+            raise RuntimeError("Evaluator is not set.")
+
+        if self.evaluator.engine == "hf":
+            metrics: dict[str, float] = {}
+            if self._is_main_process():
+                model = cast(Any, self._unwrap_model_for_saving())
+                metrics = self.evaluator.evaluate_with_model(
+                    model=model, tokenizer=self.evaluator.tokenizer
+                )
+            if self.accelerator is not None:
+                self.accelerator.wait_for_everyone()
+            if not self._is_main_process():
+                return {}
+        else:
+            model_dir = self.output_dir / "eval_latest"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            if self._is_main_process():
+                model = cast(Any, self._unwrap_model_for_saving())
+                model.save_pretrained(model_dir)
+                self.tokenizer.save_pretrained(model_dir)
+            if self.accelerator is not None:
+                self.accelerator.wait_for_everyone()
+
+            if not self._is_main_process():
+                return {}
+
+            self.evaluator.set_model(str(model_dir))
+            metrics = self.evaluator.evaluate()
+
+        if self._wandb is not None:
+            self._wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=step)
+
+        return metrics
 
     def _extract_sample(self, sample: Any) -> Tuple[list[dict[str, object]], Optional[str]]:
         if isinstance(sample, dict):
@@ -184,19 +269,26 @@ class SFTTrainer:
             return token_ids.tolist()
         return token_ids
 
-    def _chat_ids_and_user_mask(self, messages: list[dict[str, object]]) -> Tuple[list[int], list[bool]]:
-        full_ids = self._apply_chat_template_ids(messages)
-        user_mask = [False] * len(full_ids)
+    def _chat_template_message_spans(
+        self, messages: list[dict[str, object]]
+    ) -> Tuple[list[int], list[tuple[int, int, str]]]:
+        """Return token ids and per-message token spans (start, end, role).
+
+        Spans are computed by tokenizing prefixes of `messages` using `apply_chat_template` and
+        taking deltas. This lets us mask tokens by role for multi-turn chats.
+        """
+        spans: list[tuple[int, int, str]] = []
         prev_len = 0
-        for idx in range(len(messages)):
-            current_ids = self._apply_chat_template_ids(messages[: idx + 1])
-            cur_len = len(current_ids)
-            if messages[idx].get("role") == "user":
-                for j in range(prev_len, cur_len):
-                    if j < len(user_mask):
-                        user_mask[j] = True
-            prev_len = cur_len
-        return full_ids, user_mask
+        full_ids = self._apply_chat_template_ids(messages)
+
+        for idx, msg in enumerate(messages):
+            prefix_ids = self._apply_chat_template_ids(messages[: idx + 1])
+            end = len(prefix_ids)
+            role = str(msg.get("role", ""))
+            spans.append((prev_len, end, role))
+            prev_len = end
+
+        return full_ids, spans
 
     def _build_batch(self, prompts: Iterable[Any], responses: Iterable[Optional[str]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_input_ids: list[list[int]] = []
@@ -207,19 +299,25 @@ class SFTTrainer:
             prompt = self._normalize_prompt(prompt)
 
             messages = list(prompt)
-            if response is not None:
+            if response:
                 messages.append({"role": "assistant", "content": response})
-            input_ids, user_mask = self._chat_ids_and_user_mask(messages)
+            input_ids, spans = self._chat_template_message_spans(messages)
+            labels = list(input_ids) if not self.mask_prompt else [-100] * len(input_ids)
+
+            if self.mask_prompt:
+                assistant_spans = [(s, e) for s, e, r in spans if r == "assistant"]
+                if not assistant_spans:
+                    raise ValueError("No assistant messages found; nothing to train on.")
+
+                spans_to_train = assistant_spans if self.assistant_loss_mode == "all" else [assistant_spans[-1]]
+                for start, end in spans_to_train:
+                    labels[start:end] = input_ids[start:end]
+
             if self.max_seq_len is not None and len(input_ids) > self.max_seq_len:
                 input_ids = input_ids[: self.max_seq_len]
-                user_mask = user_mask[: self.max_seq_len]
-                
+                labels = labels[: self.max_seq_len]
+
             attention_mask = [1] * len(input_ids)
-            labels = list(input_ids)
-            if self.mask_prompt:
-                for i, mask in enumerate(user_mask):
-                    if mask:
-                        labels[i] = -100
 
             batch_input_ids.append(input_ids)
             batch_attention_mask.append(attention_mask)
@@ -244,6 +342,8 @@ class SFTTrainer:
         dataset_len = len(self.train_dataset)
         if dataset_len == 0:
             raise ValueError("Dataset is empty.")
+        if self.eval_steps is not None and self.evaluator is None:
+            raise ValueError("evaluator is required when eval_steps is set.")
 
         self.model.train()
 
@@ -273,92 +373,140 @@ class SFTTrainer:
             loss = outputs.loss
 
             self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
+            if self.accelerator is None:
+                loss.backward()
+            else:
+                self.accelerator.backward(loss)
             if self.max_grad_norm is not None:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
             self.optimizer.step()
             if self.lr_scheduler is not None:
                 self.lr_scheduler.step()
 
-            if step % self.logging_steps == 0:
+            if (step + 1) % self.logging_steps == 0:
                 loss_val = float(loss.item())
-                logger.info("step %d loss=%.6f", step, loss_val)
+                if self._is_main_process():
+                    logger.info("step %d loss=%.6f", step + 1, loss_val)
                 if self._wandb is not None:
                     self._wandb.log(
                         {
-                            "loss": loss_val,
+                            "train/loss": loss_val,
                             "lr": self.optimizer.param_groups[0]["lr"],
                         },
-                        step=step,
+                        step=step + 1,
                     )
 
-            if step % self.saving_steps == 0:
-                step_output_dir = self.output_dir / f"step_{step}"
+            if self.eval_steps is not None and (step + 1) % self.eval_steps == 0:
+                self._evaluate_with_evaluator(step=step + 1)
+
+            if (step + 1) % self.saving_steps == 0:
+                step_output_dir = self.output_dir / f"step_{step + 1}"
                 step_output_dir.mkdir(parents=True, exist_ok=True)
-                self.model.save_pretrained(step_output_dir)
-                self.tokenizer.save_pretrained(step_output_dir)
+                if self._is_main_process():
+                    model = cast(Any, self._unwrap_model_for_saving())
+                    model.save_pretrained(step_output_dir)
+                    self.tokenizer.save_pretrained(step_output_dir)
+                if self.accelerator is not None:
+                    self.accelerator.wait_for_everyone()
+
+        # Save final model
+        final_output_dir = self.output_dir / "final"
+        final_output_dir.mkdir(parents=True, exist_ok=True)
+        if self._is_main_process():
+            model = cast(Any, self._unwrap_model_for_saving())
+            model.save_pretrained(final_output_dir)
+            self.tokenizer.save_pretrained(final_output_dir)
+            logger.info("Saved final model to %s", final_output_dir)
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
 
         if self._wandb is not None:
             self._wandb.finish()
 
-    def test(self, dataset: Optional[Sequence[Any]] = None, num_batches: Optional[int] = None) -> dict:
-        eval_dataset = dataset if dataset is not None else self.eval_dataset
-        if eval_dataset is None:
-            raise ValueError("Eval dataset is required for testing.")
+    def test(
+        self,
+        dataset: Optional[Sequence[Any]] = None,
+        num_batches: Optional[int] = None,
+        step: Optional[int] = None,
+    ) -> dict:
+        if dataset is None:
+            raise ValueError("dataset is required for testing.")
+        eval_dataset = dataset
         dataset_len = len(eval_dataset)
         if dataset_len == 0:
             raise ValueError("Eval dataset is empty.")
 
         self.model.eval()
 
-        if num_batches is None:
-            indices = list(range(dataset_len))
-        else:
-            indices = [random.randint(0, dataset_len - 1) for _ in range(num_batches * self.batch_size)]
+        try:
+            if num_batches is None:
+                indices = list(range(dataset_len))
+            else:
+                indices = [random.randint(0, dataset_len - 1) for _ in range(num_batches * self.batch_size)]
 
-        total_loss = 0.0
-        total_tokens = 0
-        batches = 0
+            total_loss = 0.0
+            total_tokens = 0
+            batches = 0
 
-        for start in range(0, len(indices), self.batch_size):
-            batch_indices = indices[start : start + self.batch_size]
-            batch_samples = [eval_dataset[i] for i in batch_indices]
+            for start in range(0, len(indices), self.batch_size):
+                batch_indices = indices[start : start + self.batch_size]
+                batch_samples = [eval_dataset[i] for i in batch_indices]
 
-            prompts = []
-            responses = []
-            for sample in batch_samples:
-                prompt, response = self._extract_sample(sample)
-                prompts.append(prompt)
-                responses.append(None if response is None else str(response))
+                prompts = []
+                responses = []
+                for sample in batch_samples:
+                    prompt, response = self._extract_sample(sample)
+                    prompts.append(prompt)
+                    responses.append(None if response is None else str(response))
 
-            input_ids, attention_mask, labels = self._build_batch(prompts, responses)
+                input_ids, attention_mask, labels = self._build_batch(prompts, responses)
 
-            model_device = next(self.model.parameters()).device
-            input_ids = input_ids.to(model_device)
-            attention_mask = attention_mask.to(model_device)
-            labels = labels.to(model_device)
+                model_device = next(self.model.parameters()).device
+                input_ids = input_ids.to(model_device)
+                attention_mask = attention_mask.to(model_device)
+                labels = labels.to(model_device)
 
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                )
-                loss = outputs.loss
+                with torch.no_grad():
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+                    loss = outputs.loss
 
-            token_count = int((labels != -100).sum().item())
-            if token_count > 0:
-                total_loss += float(loss.item()) * token_count
-                total_tokens += token_count
-            batches += 1
+                token_count = int((labels != -100).sum().item())
+                if token_count > 0:
+                    total_loss += float(loss.item()) * token_count
+                    total_tokens += token_count
+                batches += 1
 
-        avg_loss = total_loss / max(total_tokens, 1)
-        logger.info("test loss=%.6f tokens=%d batches=%d", avg_loss, total_tokens, batches)
+            avg_loss = total_loss / max(total_tokens, 1)
+            perplexity = float(torch.exp(torch.tensor(avg_loss)).item())
 
-        self.model.train()
+            logger.info(
+                "eval loss=%.6f perplexity=%.4f tokens=%d batches=%d",
+                avg_loss,
+                perplexity,
+                total_tokens,
+                batches,
+            )
 
-        return {
-            "loss": avg_loss,
-            "tokens": total_tokens,
-            "batches": batches,
-        }
+            if self._wandb is not None:
+                log_data = {
+                    "eval/loss": avg_loss,
+                    "eval/perplexity": perplexity,
+                    "eval/tokens": total_tokens,
+                }
+                if step is not None:
+                    self._wandb.log(log_data, step=step)
+                else:
+                    self._wandb.log(log_data)
+
+            return {
+                "loss": avg_loss,
+                "perplexity": perplexity,
+                "tokens": total_tokens,
+                "batches": batches,
+            }
+        finally:
+            self.model.train()

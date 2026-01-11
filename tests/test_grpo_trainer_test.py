@@ -23,6 +23,8 @@ def test_grpo_test_reports_reward_and_tokens():
     trainer.model = DummyModel()
     trainer.max_error = 1.0
     trainer.invalid_penalty = 1.0
+    trainer.sampling_temperature = 1.0
+    trainer._wandb = None
 
     def sample_completions_batch(envs):
         texts = ["4", "0"]

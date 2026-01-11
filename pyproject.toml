@@ -41,6 +41,13 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.uv]
+dev-dependencies = [
+    "pytest",
+    "ruff",
+    "ty",
+]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

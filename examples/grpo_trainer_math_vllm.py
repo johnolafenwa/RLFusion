@@ -2,6 +2,7 @@ import logging
 
 from rlfusion.datasets import IntellectMathDataset
 from rlfusion.datasets.aime import AIME2025
+from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.trainers.grpo_trainer import GRPOTrainer
 
 
@@ -12,14 +13,27 @@ def main() -> None:
         seed=123,
     )
     eval_dataset = AIME2025()
+    evaluator = Evaluator(
+        model="Qwen/Qwen2.5-0.5B-Instruct",
+        dataset=eval_dataset,
+        output_dir="./outputs/grpo_intellect_math_vllm/eval",
+        num_batches=1,
+        engine="vllm",
+        vllm_args={
+            "tensor_parallel_size": 1,
+        },
+        max_new_tokens=64,
+        batch_size=1,
+    )
 
     trainer = GRPOTrainer(
         model="Qwen/Qwen2.5-0.5B-Instruct",
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
         num_steps=5,
         saving_steps=5,
         logging_steps=1,
+        eval_steps=1,
+        evaluator=evaluator,
         enable_wandb=False,
         sampling_temperature=0.7,
         kl_penalty=0.0,
@@ -34,6 +48,7 @@ def main() -> None:
         vllm_args={
             "tensor_parallel_size": 1,
         },
+        use_accelerate=True,
     )
 
     trainer.train()

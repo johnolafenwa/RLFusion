@@ -3,6 +3,8 @@ import logging
 from torch.utils.data import Dataset
 
 from rlfusion.envs import EnvBase
+from rlfusion.datasets.rlvr import MathDataset
+from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.trainers.sft_trainer import SFTTrainer
 
 
@@ -34,15 +36,30 @@ class ToySFTDataset(Dataset):
 
 def main() -> None:
     dataset = ToySFTDataset()
+    eval_dataset = MathDataset(
+        num_samples=64,
+        min_val=0,
+        max_val=50,
+        operand="add",
+    )
 
     trainer = SFTTrainer(
         model="Qwen/Qwen2.5-0.5B-Instruct",
         train_dataset=dataset,
-        eval_dataset=dataset,
         num_steps=100,
         batch_size=2,
         saving_steps=2,
         logging_steps=1,
+        eval_steps=10,
+        evaluator=Evaluator(
+            model="Qwen/Qwen2.5-0.5B-Instruct",
+            dataset=eval_dataset,
+            output_dir="./outputs/sft_example/eval",
+            num_batches=1,
+            engine="hf",
+            max_new_tokens=64,
+            batch_size=1,
+        ),
         enable_wandb=False,
         output_dir="./outputs/sft_example",
         log_level=logging.INFO,

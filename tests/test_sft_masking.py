@@ -43,6 +43,7 @@ def _make_trainer(mask_prompt=True):
     trainer.tokenizer = DummyTokenizer()
     trainer.max_seq_len = None
     trainer.mask_prompt = mask_prompt
+    trainer.assistant_loss_mode = "all"
     return trainer
 
 
@@ -55,17 +56,20 @@ def test_sft_masks_user_tokens():
     response = "A"
 
     input_ids, attention_mask, labels = trainer._build_batch([prompt], [response])
-    messages = list(prompt) + [{"role": "assistant", "content": response}]
-    ref_ids, user_mask = trainer._chat_ids_and_user_mask(messages)
+    assert attention_mask[0].sum().item() == input_ids.shape[1]
 
-    assert input_ids.shape[1] == len(ref_ids)
-    for idx, is_user in enumerate(user_mask):
-        if attention_mask[0, idx].item() == 0:
-            continue
-        if is_user:
-            assert labels[0, idx].item() == -100
-        else:
-            assert labels[0, idx].item() == input_ids[0, idx].item()
+    messages = list(prompt) + [{"role": "assistant", "content": response}]
+    full_ids, spans = trainer._chat_template_message_spans(messages)
+    assert input_ids.shape[1] == len(full_ids)
+
+    for start, end, role in spans:
+        for idx in range(start, end):
+            if attention_mask[0, idx].item() == 0:
+                continue
+            if role in {"system", "user"}:
+                assert labels[0, idx].item() == -100
+            else:
+                assert labels[0, idx].item() == input_ids[0, idx].item()
 
 
 def test_sft_no_mask_when_disabled():
@@ -82,3 +86,56 @@ def test_sft_no_mask_when_disabled():
             assert labels[0, idx].item() == -100
         else:
             assert labels[0, idx].item() == input_ids[0, idx].item()
+
+
+def test_sft_trains_all_assistant_turns_when_enabled():
+    trainer = _make_trainer(mask_prompt=True)
+    trainer.assistant_loss_mode = "all"
+
+    prompt = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "U1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "U2"},
+        {"role": "assistant", "content": "A2"},
+    ]
+
+    input_ids, _attention_mask, labels = trainer._build_batch([prompt], [None])
+    messages = list(prompt)
+    full_ids, spans = trainer._chat_template_message_spans(messages)
+    assert input_ids.shape[1] == len(full_ids)
+
+    for start, end, role in spans:
+        for idx in range(start, end):
+            if role == "assistant":
+                assert labels[0, idx].item() == input_ids[0, idx].item()
+            else:
+                assert labels[0, idx].item() == -100
+
+
+def test_sft_trains_only_last_assistant_turn_when_enabled():
+    trainer = _make_trainer(mask_prompt=True)
+    trainer.assistant_loss_mode = "last"
+
+    prompt = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "U1"},
+        {"role": "assistant", "content": "A1"},
+        {"role": "user", "content": "U2"},
+        {"role": "assistant", "content": "A2"},
+    ]
+
+    input_ids, _attention_mask, labels = trainer._build_batch([prompt], [None])
+    messages = list(prompt)
+    full_ids, spans = trainer._chat_template_message_spans(messages)
+    assert input_ids.shape[1] == len(full_ids)
+
+    assistant_spans = [(s, e) for s, e, r in spans if r == "assistant"]
+    assert len(assistant_spans) == 2
+    last_start, last_end = assistant_spans[-1]
+
+    for idx in range(input_ids.shape[1]):
+        if last_start <= idx < last_end:
+            assert labels[0, idx].item() == input_ids[0, idx].item()
+        else:
+            assert labels[0, idx].item() == -100

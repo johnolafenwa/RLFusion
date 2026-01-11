@@ -15,8 +15,24 @@ Recommended starting point:
 Notes:
 - Use a stronger teacher for better distillation signal.
 - If reverse KL is noisy, lower temperature or reduce max new tokens.
-- Set `eval_steps` and pass `eval_dataset` to run evaluation during training.
+- Set `eval_steps` and pass an `Evaluator` to run evaluation during training.
+- For multi-GPU, run with `accelerate launch` and set `use_accelerate=True`.
 - vLLM is supported via `engine="vllm"` and optional `vllm_args`.
 - When using vLLM, weights are refreshed each training step by saving to
   `output_dir/vllm_latest` and re-initializing the engine.
 - RLFusion sets `VLLM_ATTENTION_BACKEND=FLASH_ATTN` when the variable is unset.
+
+## Distributed Training (Accelerate)
+To run on-policy distillation on multiple GPUs:
+
+1) Pass `use_accelerate=True` to `OnPolicyDistillationTrainer`.
+2) Launch with Accelerate:
+
+```bash
+accelerate launch --num_processes 2 examples/onpolicy_distillation_example.py
+```
+
+Notes:
+- `batch_size` is per-process; effective batch size is `batch_size * num_processes`.
+- Student and teacher models are loaded in each process; plan GPU memory accordingly.
+- Checkpoints and evaluation (when `eval_steps` + `evaluator` are set) run on the main process.

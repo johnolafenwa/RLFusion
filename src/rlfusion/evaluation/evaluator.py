@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import importlib
-import inspect
 import json
 import logging
-import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Optional, Tuple, List, cast
+from typing import Any, Optional, Tuple, List
 
 import torch
 from tqdm import tqdm
@@ -25,7 +23,8 @@ else:
 from transformers import AutoTokenizer
 
 from rlfusion.envs import EnvBase
-from rlfusion.trainers.types import GenerateOutput
+from rlfusion.inference.hf_utils import sample_completions_batch_hf
+from rlfusion.inference.vllm_utils import build_sampling_params, load_vllm_engine
 from rlfusion.trainers.utils import (
     configure_torch_backends,
     format_prompt,
@@ -63,6 +62,7 @@ class Evaluator:
         max_log_chars: Optional[int] = 320,
         show_progress: bool = True,
         log_level: int = logging.INFO,
+        num_batches: Optional[int] = None,
     ) -> None:
         set_seed(seed)
         self._configure_logging(log_level)
@@ -79,16 +79,23 @@ class Evaluator:
         self.log_completions = log_completions
         self.max_log_chars = max_log_chars
         self.show_progress = show_progress
+        if num_batches is not None and num_batches <= 0:
+            raise ValueError("num_batches must be >= 1 or None.")
+        self.num_batches = num_batches
 
         if engine not in {"hf", "vllm"}:
             raise ValueError("engine must be 'hf' or 'vllm'.")
         self.engine = engine
+        self._model_id_or_path = model
+        self._vllm_args = vllm_args or {}
+        self._hf_model_kwargs: dict[str, Any] = {}
         self._vllm = None
         self._vllm_sampling_params_cls = None
         self._vllm_sampling_param_keys = None
 
         device = "vllm"
         device_map = "vllm"
+        self.model: Any = None
         if self.engine == "hf":
             device = get_device()
             if device == "cuda":
@@ -107,30 +114,11 @@ class Evaluator:
                 model_kwargs["dtype"] = dtype
             elif device == "mps":
                 model_kwargs["dtype"] = torch.float16
+            self._hf_model_kwargs = model_kwargs
             self.model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
         else:
-            if os.environ.get("VLLM_ATTENTION_BACKEND") is None:
-                os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
-                logger.info("Set VLLM_ATTENTION_BACKEND=FLASH_ATTN for vLLM.")
-            if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") is None:
-                os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-                logger.info("Set VLLM_WORKER_MULTIPROC_METHOD=spawn for vLLM.")
-            elif os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
-                logger.warning(
-                    "VLLM_WORKER_MULTIPROC_METHOD=%s may fail with CUDA; prefer 'spawn'.",
-                    os.environ.get("VLLM_WORKER_MULTIPROC_METHOD"),
-                )
-            vllm_args = vllm_args or {}
-            try:
-                from vllm import LLM, SamplingParams
-            except Exception as exc:
-                raise ImportError(
-                    "vllm is required for engine='vllm'. Install with: uv pip install vllm"
-                ) from exc
-            self._vllm = LLM(model=model, **vllm_args)
-            self._vllm_sampling_params_cls = SamplingParams
-            self._vllm_sampling_param_keys = set(
-                inspect.signature(SamplingParams).parameters.keys()
+            self._vllm, self._vllm_sampling_params_cls, self._vllm_sampling_param_keys = (
+                load_vllm_engine(model, self._vllm_args)
             )
             self.model = None
 
@@ -163,6 +151,24 @@ class Evaluator:
             except Exception as exc:
                 logger.warning("wandb could not be enabled: %s", exc)
 
+    def set_model(self, model: str) -> None:
+        """Update the evaluator to point at a new model checkpoint (path or HF id)."""
+        self._model_id_or_path = model
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model)
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
+
+        if self.engine == "hf":
+            self.model = AutoModelForCausalLM.from_pretrained(model, **self._hf_model_kwargs)
+            return
+
+        self._vllm, self._vllm_sampling_params_cls, self._vllm_sampling_param_keys = (
+            load_vllm_engine(model, self._vllm_args)
+        )
+        self.model = None
+
     def _configure_logging(self, log_level: int) -> None:
         if not logging.getLogger().handlers:
             logging.basicConfig(
@@ -182,22 +188,28 @@ class Evaluator:
             raise RuntimeError("vLLM engine is not initialized.")
         if self._vllm_sampling_param_keys is None:
             raise RuntimeError("vLLM sampling parameters are unavailable.")
+        return build_sampling_params(
+            self._vllm_sampling_params_cls,
+            self._vllm_sampling_param_keys,
+            generation_args=self.generation_args,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=self.do_sample,
+            temperature=self.sampling_temperature,
+        )
 
-        max_tokens = self.generation_args.get("max_tokens", self.max_new_tokens)
-        if "max_new_tokens" in self.generation_args and "max_tokens" not in self.generation_args:
-            max_tokens = self.generation_args["max_new_tokens"]
-
-        sampling_kwargs: dict[str, Any] = {
-            "max_tokens": max_tokens,
-            "temperature": self.sampling_temperature if self.do_sample else 0.0,
-        }
-        for key, value in self.generation_args.items():
-            if key == "max_new_tokens":
-                continue
-            if key in self._vllm_sampling_param_keys:
-                sampling_kwargs[key] = value
-
-        return self._vllm_sampling_params_cls(**sampling_kwargs)
+    def evaluate_with_model(self, model: torch.nn.Module, tokenizer: AutoTokenizer) -> dict[str, float]:
+        """Evaluate an in-memory HF model without saving/loading checkpoints."""
+        if self.engine != "hf":
+            raise ValueError("evaluate_with_model is only supported for engine='hf'.")
+        previous_model = self.model
+        previous_tokenizer = self.tokenizer
+        self.model = model
+        self.tokenizer = tokenizer
+        try:
+            return self.evaluate()
+        finally:
+            self.model = previous_model
+            self.tokenizer = previous_tokenizer
 
     def _sample_completions_batch_vllm(
         self, envs: List[EnvBase]
@@ -256,74 +268,23 @@ class Evaluator:
     ) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
         if self.engine == "vllm":
             return self._sample_completions_batch_vllm(envs)
+        model = self.model
+        return sample_completions_batch_hf(
+            model=model,
+            tokenizer=self.tokenizer,
+            envs=envs,
+            do_sample=self.do_sample,
+            sampling_temperature=self.sampling_temperature,
+            max_new_tokens=self.max_new_tokens,
+            generation_args=self.generation_args,
+        )
 
-        formatted_prompts = []
-        for env in envs:
-            formatted_prompt = self.tokenizer.apply_chat_template(
-                env.prompt,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-            formatted_prompts.append(formatted_prompt)
-
-        input_tokens = self.tokenizer(formatted_prompts, return_tensors="pt", padding=True)
-        model_device = next(self.model.parameters()).device
-        input_ids = input_tokens["input_ids"].to(model_device)
-        attention_mask = input_tokens["attention_mask"].to(model_device)
-        prompt_lengths = attention_mask.sum(dim=1).tolist()
-
-        gen_kwargs = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "do_sample": self.do_sample,
-            "max_new_tokens": self.max_new_tokens,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "return_dict_in_generate": True,
-            "output_scores": False,
-            "use_cache": getattr(self.model.config, "use_cache", True),
-        }
-        if self.do_sample:
-            gen_kwargs["temperature"] = self.sampling_temperature
-        if self.generation_args:
-            gen_kwargs.update(self.generation_args)
-
-        with torch.no_grad():
-            outputs = cast(GenerateOutput, self.model.generate(**gen_kwargs))
-
-        generated_sequences = outputs.sequences
-        ret_texts = []
-        completion_lengths = []
-        eos_token_id = self.tokenizer.eos_token_id
-        pad_token_id = self.tokenizer.pad_token_id
-
-        input_length = input_ids.shape[1]
-        for i in range(len(prompt_lengths)):
-            output_token_ids = generated_sequences[i]
-            generated_token_ids = output_token_ids[input_length:]
-            end_offset = generated_token_ids.shape[0]
-
-            if eos_token_id is not None:
-                eos_positions = (generated_token_ids == eos_token_id).nonzero(as_tuple=True)[0]
-                if eos_positions.numel() > 0:
-                    end_offset = min(end_offset, int(eos_positions[0]))
-
-            if pad_token_id is not None:
-                pad_positions = (generated_token_ids == pad_token_id).nonzero(as_tuple=True)[0]
-                if pad_positions.numel() > 0:
-                    end_offset = min(end_offset, int(pad_positions[0]))
-
-            completion_token_ids = generated_token_ids[:end_offset]
-            text = self.tokenizer.decode(completion_token_ids, skip_special_tokens=True)
-            ret_texts.append(text)
-            completion_lengths.append(max(end_offset, 0))
-
-        return generated_sequences, ret_texts, prompt_lengths, completion_lengths
-
-    def evaluate(self, num_batches: Optional[int] = None) -> dict[str, float]:
+    def evaluate(self) -> dict[str, float]:
         dataset_len = len(self.dataset)
         if dataset_len == 0:
             raise ValueError("Eval dataset is empty.")
 
+        num_batches = self.num_batches
         if num_batches is None:
             indices = list(range(dataset_len))
         else:

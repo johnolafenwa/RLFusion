@@ -165,8 +165,8 @@ def test_evaluator_vllm_engine_uses_generation_outputs(monkeypatch):
             return [FakeRequestOutput() for _ in prompts]
 
     fake_vllm = ModuleType("vllm")
-    fake_vllm.LLM = FakeLLM
-    fake_vllm.SamplingParams = FakeSamplingParams
+    setattr(fake_vllm, "LLM", FakeLLM)
+    setattr(fake_vllm, "SamplingParams", FakeSamplingParams)
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setattr("rlfusion.evaluation.evaluator.AutoTokenizer", FakeAutoTokenizer)
 
