@@ -19,9 +19,7 @@ def main() -> None:
         output_dir="./outputs/grpo_intellect_math_vllm/eval",
         num_batches=1,
         engine="vllm",
-        vllm_args={
-            "tensor_parallel_size": 1,
-        },
+        vllm_args={"tensor_parallel_size": 1},
         max_new_tokens=64,
         batch_size=1,
     )
@@ -44,10 +42,6 @@ def main() -> None:
         log_completions=True,
         max_log_chars=200,
         log_level=logging.INFO,
-        engine="vllm",
-        vllm_args={
-            "tensor_parallel_size": 1,
-        },
         use_accelerate=True,
     )
 

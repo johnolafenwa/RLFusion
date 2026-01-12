@@ -29,15 +29,13 @@ uv pip install flash-attn --no-build-isolation
 If FlashAttention is not available, the trainers automatically fall back to PyTorch SDPA.
 
 ## vLLM (Optional)
-To use vLLM for generation in GRPO or on-policy distillation:
+To use vLLM in the `Evaluator`:
 
 ```bash
 uv pip install vllm
 ```
 
-Set `engine="vllm"` and optionally pass `vllm_args` (forwarded to `vllm.LLM`). When vLLM is
-enabled, the trainers refresh inference weights each training step by saving to
-`output_dir/vllm_latest` and re-initializing the vLLM engine. RLFusion also sets
+Set `engine="vllm"` and optionally pass `vllm_args` (forwarded to `vllm.LLM`). RLFusion also sets
 `VLLM_ATTENTION_BACKEND=FLASH_ATTN` when the variable is unset.
 
 ## Dev Setup
@@ -61,7 +59,7 @@ accelerate launch --num_processes 2 your_script.py
 Notes:
 - `batch_size` is per-process; effective batch size is `batch_size * num_processes`.
 - Logging, evaluation, and checkpoint saving are handled on the main process (rank 0).
-- vLLM generation runs per process (typically 1 GPU per process under Accelerate).
+- If your `Evaluator` uses `engine="vllm"`, it runs on the main process and uses whatever GPUs are visible to that process.
 
 ## Core Concepts
 ### Environment
@@ -152,13 +150,9 @@ trainer = GRPOTrainer(
 trainer.train()
 ```
 
-To use vLLM for generation, add:
+To use vLLM for evaluation, add:
 ```python
-trainer = GRPOTrainer(
-    ...,
-    engine="vllm",
-    vllm_args={"tensor_parallel_size": 1},
-)
+evaluator = Evaluator(..., engine="vllm", vllm_args={"tensor_parallel_size": 1})
 ```
 
 ### On-policy Distillation
@@ -192,13 +186,9 @@ trainer = OnPolicyDistillationTrainer(
 trainer.train()
 ```
 
-To use vLLM for generation, add:
+To use vLLM for evaluation, add:
 ```python
-trainer = OnPolicyDistillationTrainer(
-    ...,
-    engine="vllm",
-    vllm_args={"tensor_parallel_size": 1},
-)
+evaluator = Evaluator(..., engine="vllm", vllm_args={"tensor_parallel_size": 1})
 ```
 
 ## Training Guides

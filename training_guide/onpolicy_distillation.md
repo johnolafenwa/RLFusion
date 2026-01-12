@@ -17,10 +17,7 @@ Notes:
 - If reverse KL is noisy, lower temperature or reduce max new tokens.
 - Set `eval_steps` and pass an `Evaluator` to run evaluation during training.
 - For multi-GPU, run with `accelerate launch` and set `use_accelerate=True`.
-- vLLM is supported via `engine="vllm"` and optional `vllm_args`.
-- When using vLLM, weights are refreshed each training step by saving to
-  `output_dir/vllm_latest` and re-initializing the engine.
-- RLFusion sets `VLLM_ATTENTION_BACKEND=FLASH_ATTN` when the variable is unset.
+- vLLM is supported in the `Evaluator` via `engine="vllm"` and optional `vllm_args`.
 
 ## Distributed Training (Accelerate)
 To run on-policy distillation on multiple GPUs:

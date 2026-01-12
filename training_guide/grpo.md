@@ -17,10 +17,7 @@ Notes:
 - Increase `group_size` for more stable advantage estimates.
 - If outputs collapse, increase `kl_penalty` slightly.
 - Set `eval_steps` and pass an `Evaluator` to run evaluation during training.
-- vLLM is supported via `engine="vllm"` and optional `vllm_args`.
-- When using vLLM, weights are refreshed each training step by saving to
-  `output_dir/vllm_latest` and re-initializing the engine.
-- RLFusion sets `VLLM_ATTENTION_BACKEND=FLASH_ATTN` when the variable is unset.
+- vLLM is supported in the `Evaluator` via `engine="vllm"` and optional `vllm_args`.
 
 ## Distributed Training (Accelerate)
 To run GRPO on multiple GPUs:
@@ -35,4 +32,3 @@ accelerate launch --num_processes 2 examples/grpo_trainer_math.py
 Notes:
 - `batch_size` and `group_size` are per-process; effective sample throughput scales with `num_processes`.
 - Checkpoints and evaluation (when `eval_steps` + `evaluator` are set) run on the main process.
-- With `engine="vllm"`, each process owns its own vLLM engine and reloads weights each step.

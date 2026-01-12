@@ -23,7 +23,6 @@ from transformers import AutoTokenizer
 
 from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.inference.hf_utils import sample_completions_batch_hf
-from rlfusion.inference.vllm_utils import build_sampling_params, load_vllm_engine
 from rlfusion.trainers.data import Trajectory
 from rlfusion.trainers.utils import (
     get_device,
@@ -72,8 +71,6 @@ class GRPOTrainer():
                  invalid_penalty: float = 1.0,
                  max_grad_norm: Optional[float] = None,
                  log_level: int = logging.INFO,
-                 engine: str = "hf",
-                 vllm_args: Optional[dict[str, Any]] = None,
                  evaluator: Optional[Evaluator] = None,
                  use_accelerate: bool = False,
                  ):
@@ -114,14 +111,6 @@ class GRPOTrainer():
         self.eval_steps = eval_steps
         self.evaluator = evaluator
 
-        if engine not in {"hf", "vllm"}:
-            raise ValueError("engine must be 'hf' or 'vllm'.")
-        self.engine = engine
-        self._vllm = None
-        self._vllm_sampling_params_cls = None
-        self._vllm_sampling_param_keys = None
-        self._vllm_args = vllm_args or {}
-
         device = get_device()
 
         if device == "cuda":
@@ -159,9 +148,6 @@ class GRPOTrainer():
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
-        if self.engine == "vllm":
-            self._init_vllm_engine(model)
-
         if kl_penalty > 0.0:
             self.ref_model = AutoModelForCausalLM.from_pretrained(
                 model,
@@ -195,7 +181,6 @@ class GRPOTrainer():
                         "model": model,
                         "device": device,
                         "device_map": device_map,
-                        "engine": engine,
                         "num_steps": num_steps,
                         "saving_steps": saving_steps,
                         "logging_steps": logging_steps,
@@ -219,7 +204,6 @@ class GRPOTrainer():
                         "clip_eps": self.clip_eps,
                         "max_error": self.max_error,
                         "invalid_penalty": self.invalid_penalty,
-                        "vllm_args": self._vllm_args if self.engine == "vllm" else None,
                     },
                 )
 
@@ -304,122 +288,7 @@ class GRPOTrainer():
 
         return metrics
 
-    def _init_vllm_engine(self, model_path: str) -> None:
-        self._vllm, self._vllm_sampling_params_cls, self._vllm_sampling_param_keys = (
-            load_vllm_engine(model_path, self._vllm_args)
-        )
-
-    def _build_vllm_sampling_params(self) -> Any:
-        if self._vllm_sampling_params_cls is None:
-            raise RuntimeError("vLLM engine is not initialized.")
-        if self._vllm_sampling_param_keys is None:
-            raise RuntimeError("vLLM sampling parameters are unavailable.")
-        return build_sampling_params(
-            self._vllm_sampling_params_cls,
-            self._vllm_sampling_param_keys,
-            generation_args=self.generation_args,
-            max_new_tokens=self.max_new_tokens,
-            do_sample=True,
-            temperature=self.sampling_temperature,
-        )
-
-    def _sample_completions_batch_vllm(
-        self, envs: List[EnvBase]
-    ) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
-        if self._vllm is None:
-            raise RuntimeError("vLLM engine is not initialized.")
-
-        formatted_prompts = []
-        for env in envs:
-            formatted_prompt = self.tokenizer.apply_chat_template(
-                env.prompt,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-            formatted_prompts.append(formatted_prompt)
-
-        sampling_params = self._build_vllm_sampling_params()
-        outputs = self._vllm.generate(formatted_prompts, sampling_params)
-
-        ret_texts = []
-        completion_lengths = []
-        prompt_lengths = []
-        sequences_list = []
-        eos_token_id = self.tokenizer.eos_token_id
-        pad_token_id = self.tokenizer.pad_token_id
-
-        for output in outputs:
-            prompt_token_ids = list(output.prompt_token_ids)
-            prompt_lengths.append(len(prompt_token_ids))
-
-            completion_token_ids = []
-            completion_text = ""
-
-            if output.outputs:
-                completion = output.outputs[0]
-                token_ids = getattr(completion, "token_ids", None)
-                if token_ids is None:
-                    token_ids = self.tokenizer.encode(completion.text, add_special_tokens=False)
-                token_ids = list(token_ids)
-                end_offset = len(token_ids)
-
-                if eos_token_id is not None:
-                    for idx, token_id in enumerate(token_ids):
-                        if token_id == eos_token_id:
-                            end_offset = idx + 1
-                            break
-
-                if pad_token_id is not None:
-                    for idx, token_id in enumerate(token_ids):
-                        if token_id == pad_token_id:
-                            end_offset = min(end_offset, idx)
-                            break
-
-                completion_token_ids = token_ids[:end_offset]
-                completion_text = self.tokenizer.decode(
-                    completion_token_ids, skip_special_tokens=True
-                )
-
-            sequences_list.append(prompt_token_ids + completion_token_ids)
-            completion_lengths.append(len(completion_token_ids))
-            ret_texts.append(completion_text)
-
-        if sequences_list:
-            max_len = max(len(seq) for seq in sequences_list)
-        else:
-            max_len = 0
-
-        if max_len == 0:
-            sequences_tensor = torch.empty((len(envs), 0), dtype=torch.long)
-        else:
-            if pad_token_id is None:
-                pad_token_id = 0
-            padded = [seq + [pad_token_id] * (max_len - len(seq)) for seq in sequences_list]
-            sequences_tensor = torch.tensor(padded, dtype=torch.long)
-
-        model_device = next(self.model.parameters()).device
-        sequences_tensor = sequences_tensor.to(model_device)
-        return sequences_tensor, ret_texts, prompt_lengths, completion_lengths
-
-    def _refresh_vllm_weights(self) -> None:
-        if self.engine != "vllm":
-            return
-
-        vllm_output_dir = self.output_dir / "vllm_latest"
-        vllm_output_dir.mkdir(parents=True, exist_ok=True)
-        if self._is_main_process():
-            model = cast(Any, self._unwrap_model_for_saving())
-            model.save_pretrained(vllm_output_dir)
-            self.tokenizer.save_pretrained(vllm_output_dir)
-        if self.accelerator is not None:
-            self.accelerator.wait_for_everyone()
-
-        self._vllm = None
-        self._init_vllm_engine(str(vllm_output_dir))
-
     def sample_completions_batch(self, envs: List[EnvBase]) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
-        if self.engine == "vllm":
-            return self._sample_completions_batch_vllm(envs)
         model = cast(Any, self.model)
         return sample_completions_batch_hf(
             model=model,
@@ -719,9 +588,6 @@ class GRPOTrainer():
 
             log_env = env_batch[0] if env_batch else envs[0]
             self._log_step(step, log_env, trajectories, batch_stats)
-
-            if self.engine == "vllm":
-                self._refresh_vllm_weights()
 
             if self.eval_steps is not None and (step + 1) % self.eval_steps == 0:
                 self._evaluate_with_evaluator(step=step + 1)
