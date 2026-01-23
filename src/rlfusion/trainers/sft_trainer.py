@@ -124,7 +124,7 @@ class SFTTrainer:
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "left"
+        self.tokenizer.padding_side = "right"
 
         self._wandb = None
         should_enable_wandb = enable_wandb and (
