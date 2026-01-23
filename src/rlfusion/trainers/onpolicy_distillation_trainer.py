@@ -225,16 +225,70 @@ class OnPolicyDistillationTrainer:
             generation_args=self.generation_args,
         )
 
-    def get_log_probs(self, sequence_ids: torch.Tensor, model: Optional[torch.nn.Module] = None) -> torch.Tensor:
+    def _sample_completions_batch_with_mask(
+        self, envs: List[EnvBase]
+    ) -> Tuple[torch.Tensor, List[str], List[int], List[int], torch.Tensor]:
+        model = cast(Any, self.model)
+        return sample_completions_batch_hf(
+            model=model,
+            tokenizer=self.tokenizer,
+            envs=envs,
+            do_sample=True,
+            sampling_temperature=self.sampling_temperature,
+            max_new_tokens=self.max_new_tokens,
+            generation_args=self.generation_args,
+            return_attention_mask=True,
+        )
+
+    def _build_full_attention_mask(
+        self,
+        input_attention_mask: torch.Tensor,
+        completion_lengths: List[int],
+        sequence_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if input_attention_mask.ndim == 1:
+            input_attention_mask = input_attention_mask.unsqueeze(0)
+        if input_attention_mask.shape[0] != sequence_ids.shape[0]:
+            raise ValueError("input_attention_mask must match batch size.")
+        if len(completion_lengths) != sequence_ids.shape[0]:
+            raise ValueError("completion_lengths must match batch size.")
+        if input_attention_mask.shape[1] > sequence_ids.shape[1]:
+            raise ValueError("input_attention_mask exceeds sequence length.")
+
+        input_attention_mask = input_attention_mask.to(sequence_ids.device)
+        full_mask = torch.zeros_like(sequence_ids, dtype=torch.long)
+        input_len = int(input_attention_mask.shape[1])
+        full_mask[:, :input_len] = input_attention_mask.long()
+
+        for idx, completion_len in enumerate(completion_lengths):
+            end = min(input_len + int(completion_len), sequence_ids.shape[1])
+            if end > input_len:
+                full_mask[idx, input_len:end] = 1
+
+        return full_mask
+
+    def get_log_probs(
+        self,
+        sequence_ids: torch.Tensor,
+        model: Optional[torch.nn.Module] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if sequence_ids.ndim == 1:
             sequence_ids = sequence_ids.unsqueeze(0)
         if model is None:
             model = self.model
 
-        if self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id != self.tokenizer.eos_token_id:
-            attention_mask = (sequence_ids != self.tokenizer.pad_token_id).long()
+        if attention_mask is None:
+            if self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id != self.tokenizer.eos_token_id:
+                attention_mask = (sequence_ids != self.tokenizer.pad_token_id).long()
+            else:
+                attention_mask = torch.ones_like(sequence_ids)
         else:
-            attention_mask = torch.ones_like(sequence_ids)
+            if attention_mask.ndim == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+            if attention_mask.shape != sequence_ids.shape:
+                raise ValueError("attention_mask must match sequence_ids shape.")
+            attention_mask = attention_mask.to(sequence_ids.device).long()
 
         outputs = model(
             input_ids=sequence_ids,
@@ -369,12 +423,21 @@ class OnPolicyDistillationTrainer:
         for step in range(self.num_steps):
             env_batch = [self.train_dataset[random.randint(0, dataset_len - 1)] for _ in range(self.batch_size)]
 
-            sequences, texts, prompt_lens, completion_lens = self.sample_completions_batch(env_batch)
+            sequences, texts, _prompt_lens, completion_lens, input_attention_mask = (
+                self._sample_completions_batch_with_mask(env_batch)
+            )
+            full_attention_mask = self._build_full_attention_mask(
+                input_attention_mask, completion_lens, sequences
+            )
             with torch.no_grad():
-                old_log_probs = self.get_log_probs(sequences)
-                teacher_log_probs = self.get_log_probs(sequences, model=self.teacher_model)
+                old_log_probs = self.get_log_probs(sequences, attention_mask=full_attention_mask)
+                teacher_log_probs = self.get_log_probs(
+                    sequences, model=self.teacher_model, attention_mask=full_attention_mask
+                )
 
-            masks = self._build_masks(prompt_lens, completion_lens, sequences)
+            input_length = int(input_attention_mask.shape[1])
+            mask_prompt_lens = [input_length] * len(completion_lens)
+            masks = self._build_masks(mask_prompt_lens, completion_lens, sequences)
             mask_counts = masks.sum(dim=1).clamp_min(1.0)
             reverse_kl = (old_log_probs - teacher_log_probs) * masks
             advantages = -reverse_kl
@@ -382,7 +445,7 @@ class OnPolicyDistillationTrainer:
             loss = None
             for ppo_step in range(self.ppo_steps):
                 self.optimizer.zero_grad(set_to_none=True)
-                new_log_probs = self.get_log_probs(sequences)
+                new_log_probs = self.get_log_probs(sequences, attention_mask=full_attention_mask)
                 loss_per = self._ppo_loss(
                     old_log_probs,
                     new_log_probs,
@@ -500,11 +563,22 @@ class OnPolicyDistillationTrainer:
                 env_batch = [eval_dataset[i] for i in batch_indices]
 
                 with torch.no_grad():
-                    sequences, texts, prompt_lens, completion_lens = self.sample_completions_batch(env_batch)
-                    student_log_probs = self.get_log_probs(sequences)
-                    teacher_log_probs = self.get_log_probs(sequences, model=self.teacher_model)
+                    sequences, texts, _prompt_lens, completion_lens, input_attention_mask = (
+                        self._sample_completions_batch_with_mask(env_batch)
+                    )
+                    full_attention_mask = self._build_full_attention_mask(
+                        input_attention_mask, completion_lens, sequences
+                    )
+                    student_log_probs = self.get_log_probs(
+                        sequences, attention_mask=full_attention_mask
+                    )
+                    teacher_log_probs = self.get_log_probs(
+                        sequences, model=self.teacher_model, attention_mask=full_attention_mask
+                    )
 
-                masks = self._build_masks(prompt_lens, completion_lens, sequences)
+                input_length = int(input_attention_mask.shape[1])
+                mask_prompt_lens = [input_length] * len(completion_lens)
+                masks = self._build_masks(mask_prompt_lens, completion_lens, sequences)
                 mask_counts = masks.sum(dim=1).clamp_min(1.0)
                 reverse_kl = (student_log_probs - teacher_log_probs) * masks
                 loss_per = reverse_kl.sum(dim=1) / mask_counts

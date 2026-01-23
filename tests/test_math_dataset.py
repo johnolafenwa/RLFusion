@@ -37,5 +37,5 @@ def test_math_dataset_samples_match_expected(operand, symbol, fn):
 
 
 def test_math_dataset_invalid_operand_raises():
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         MathDataset(operand="pow")

@@ -294,7 +294,7 @@ class SFTTrainer:
             prompt = self._normalize_prompt(prompt)
 
             messages = list(prompt)
-            if response:
+            if response is not None:
                 messages.append({"role": "assistant", "content": response})
             input_ids, spans = self._chat_template_message_spans(messages)
             labels = list(input_ids) if not self.mask_prompt else [-100] * len(input_ids)

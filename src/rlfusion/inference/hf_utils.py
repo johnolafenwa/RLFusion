@@ -17,7 +17,10 @@ def sample_completions_batch_hf(
     sampling_temperature: float,
     max_new_tokens: int,
     generation_args: dict[str, Any],
-) -> tuple[torch.Tensor, list[str], list[int], list[int]]:
+    return_attention_mask: bool = False,
+) -> tuple[torch.Tensor, list[str], list[int], list[int]] | tuple[
+    torch.Tensor, list[str], list[int], list[int], torch.Tensor
+]:
     formatted_prompts = [
         tokenizer.apply_chat_template(
             env.prompt,
@@ -31,6 +34,7 @@ def sample_completions_batch_hf(
     model_device = next(model.parameters()).device
     input_ids = input_tokens["input_ids"].to(model_device)
     attention_mask = input_tokens["attention_mask"].to(model_device)
+    input_length = int(input_ids.shape[1])
     prompt_lengths = attention_mask.sum(dim=1).tolist()
 
     gen_kwargs: dict[str, Any] = {
@@ -58,7 +62,7 @@ def sample_completions_batch_hf(
     eos_token_id = tokenizer.eos_token_id
     pad_token_id = tokenizer.pad_token_id
 
-    input_length = input_ids.shape[1]
+    input_length = int(input_ids.shape[1])
     for _i, _prompt_len in enumerate(prompt_lengths):
         output_token_ids = generated_sequences[_i]
         generated_token_ids = output_token_ids[input_length:]
@@ -78,4 +82,6 @@ def sample_completions_batch_hf(
         ret_texts.append(tokenizer.decode(completion_token_ids, skip_special_tokens=True))
         completion_lengths.append(max(end_offset, 0))
 
+    if return_attention_mask:
+        return generated_sequences, ret_texts, prompt_lengths, completion_lengths, attention_mask
     return generated_sequences, ret_texts, prompt_lengths, completion_lengths

@@ -55,7 +55,8 @@ class MathDataset(Dataset):
             "division": OperandConfig("/", lambda a, b: a / b),
         }
 
-        assert operand in operand_to_value.keys(), f"Operand can only be one of {operand_to_value.keys()}"
+        if operand not in operand_to_value:
+            raise ValueError(f"Operand can only be one of {operand_to_value.keys()}")
 
         self.dataset = []
 
@@ -68,7 +69,7 @@ class MathDataset(Dataset):
             fn = operand_values.fn
 
             prompt = [
-                {"role": "system", "content": "Think step by step about the user question, Give the final answer as [result], for example, if the result is 5, then you should finish your response with [5]"},
+                {"role": "system", "content": "Think step by step about the user question, Give the final answer in boxed format"},
                 {"role": "user", "content": f"What is {a} {operand_value} {b} ?"}
             ]
 
@@ -88,5 +89,4 @@ class MathDataset(Dataset):
     def __len__(self) -> int:
 
         return len(self.dataset)
-
 

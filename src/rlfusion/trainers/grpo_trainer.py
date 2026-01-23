@@ -256,6 +256,21 @@ class GRPOTrainer():
             generation_args=self.generation_args,
         )
 
+    def _sample_completions_batch_with_mask(
+        self, envs: List[EnvBase]
+    ) -> Tuple[torch.Tensor, List[str], List[int], List[int], torch.Tensor]:
+        model = cast(Any, self.model)
+        return sample_completions_batch_hf(
+            model=model,
+            tokenizer=self.tokenizer,
+            envs=envs,
+            do_sample=True,
+            sampling_temperature=self.sampling_temperature,
+            max_new_tokens=self.max_new_tokens,
+            generation_args=self.generation_args,
+            return_attention_mask=True,
+        )
+
     def _compute_reward(self, env: EnvBase, completion_text: Optional[str]) -> float:
         if completion_text is None:
             return -(self.max_error + self.invalid_penalty)
@@ -278,16 +293,55 @@ class GRPOTrainer():
             assert traj.reward is not None
             traj.advantage = (traj.reward - mean_reward) / (std + eps)
 
-    def get_log_probs(self, sequence_ids: torch.Tensor, model: Optional[torch.nn.Module] = None) -> torch.Tensor:
+    def _build_full_attention_mask(
+        self,
+        input_attention_mask: torch.Tensor,
+        completion_lengths: List[int],
+        sequence_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if input_attention_mask.ndim == 1:
+            input_attention_mask = input_attention_mask.unsqueeze(0)
+        if input_attention_mask.shape[0] != sequence_ids.shape[0]:
+            raise ValueError("input_attention_mask must match batch size.")
+        if len(completion_lengths) != sequence_ids.shape[0]:
+            raise ValueError("completion_lengths must match batch size.")
+        if input_attention_mask.shape[1] > sequence_ids.shape[1]:
+            raise ValueError("input_attention_mask exceeds sequence length.")
+
+        input_attention_mask = input_attention_mask.to(sequence_ids.device)
+        full_mask = torch.zeros_like(sequence_ids, dtype=torch.long)
+        input_len = int(input_attention_mask.shape[1])
+        full_mask[:, :input_len] = input_attention_mask.long()
+
+        for idx, completion_len in enumerate(completion_lengths):
+            end = min(input_len + int(completion_len), sequence_ids.shape[1])
+            if end > input_len:
+                full_mask[idx, input_len:end] = 1
+
+        return full_mask
+
+    def get_log_probs(
+        self,
+        sequence_ids: torch.Tensor,
+        model: Optional[torch.nn.Module] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if sequence_ids.ndim == 1:
             sequence_ids = sequence_ids.unsqueeze(0)
         if model is None:
             model = self.model
 
-        if self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id != self.tokenizer.eos_token_id:
-            attention_mask = (sequence_ids != self.tokenizer.pad_token_id).long()
+        if attention_mask is None:
+            if self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id != self.tokenizer.eos_token_id:
+                attention_mask = (sequence_ids != self.tokenizer.pad_token_id).long()
+            else:
+                attention_mask = torch.ones_like(sequence_ids)
         else:
-            attention_mask = torch.ones_like(sequence_ids)
+            if attention_mask.ndim == 1:
+                attention_mask = attention_mask.unsqueeze(0)
+            if attention_mask.shape != sequence_ids.shape:
+                raise ValueError("attention_mask must match sequence_ids shape.")
+            attention_mask = attention_mask.to(sequence_ids.device).long()
 
         outputs = model(
             input_ids=sequence_ids,
@@ -341,21 +395,22 @@ class GRPOTrainer():
 
         return -(obj.sum(dim=1) / denom) + (kl_beta * (kl.sum(dim=1) / denom))
 
-    def generate_mask(self, trajectory: Trajectory) -> torch.Tensor:
-        if trajectory.prompt_len is None:
-            raise ValueError("Trajectory prompt_len is required to build the mask.")
+    def generate_mask(self, trajectory: Trajectory, input_length: Optional[int] = None) -> torch.Tensor:
+        if trajectory.prompt_len is None and input_length is None:
+            raise ValueError("Trajectory prompt_len or input_length is required to build the mask.")
         if trajectory.sequence_ids is None:
             raise ValueError("Trajectory sequence_ids is required to build the mask.")
 
         sequence_length = int(trajectory.sequence_ids.numel())
         mask = torch.zeros((sequence_length - 1,), device=trajectory.sequence_ids.device, dtype=torch.float32)
 
+        prompt_len = trajectory.prompt_len if input_length is None else int(input_length)
         completion_len = trajectory.completion_len
         if completion_len is None:
-            completion_len = max(sequence_length - trajectory.prompt_len, 0)
-        end_len = min(trajectory.prompt_len + completion_len, sequence_length)
+            completion_len = max(sequence_length - prompt_len, 0)
+        end_len = min(prompt_len + completion_len, sequence_length)
 
-        start = max(trajectory.prompt_len - 1, 0)
+        start = max(prompt_len - 1, 0)
         end = max(end_len - 2, -1)
 
         if end >= start:
@@ -461,7 +516,9 @@ class GRPOTrainer():
             for env in env_batch:
                 envs.extend([env for _ in range(self.group_size)])
 
-            sequences, texts, prompt_lens, completion_lens = self.sample_completions_batch(envs)
+            sequences, texts, prompt_lens, completion_lens, input_attention_mask = (
+                self._sample_completions_batch_with_mask(envs)
+            )
 
             trajectories = []
             for i, env_instance in enumerate(envs):
@@ -477,17 +534,23 @@ class GRPOTrainer():
 
             self.compute_advantage(trajectories)
 
+            input_length = int(input_attention_mask.shape[1])
+            full_attention_mask = self._build_full_attention_mask(
+                input_attention_mask, completion_lens, sequences
+            )
             with torch.no_grad():
-                old_log_probs = self.get_log_probs(sequences)
+                old_log_probs = self.get_log_probs(sequences, attention_mask=full_attention_mask)
                 if self.ref_model is not None:
-                    ref_log_probs = self.get_log_probs(sequences, model=self.ref_model)
+                    ref_log_probs = self.get_log_probs(
+                        sequences, model=self.ref_model, attention_mask=full_attention_mask
+                    )
                 else:
                     ref_log_probs = torch.zeros_like(old_log_probs)
 
             for i, traj in enumerate(trajectories):
                 traj.old_log_probs = old_log_probs[i]
                 traj.ref_log_probs = ref_log_probs[i]
-                self.generate_mask(traj)
+                self.generate_mask(traj, input_length=input_length)
 
             masks = torch.stack([traj.mask for traj in trajectories]).to(sequences.device)
             advantages = torch.tensor(
@@ -503,7 +566,7 @@ class GRPOTrainer():
             batch_stats = None
             for ppo_step in range(self.ppo_steps):
                 self.optimizer.zero_grad(set_to_none=True)
-                new_log_probs = self.get_log_probs(sequences)
+                new_log_probs = self.get_log_probs(sequences, attention_mask=full_attention_mask)
 
                 loss_per = self.grpo_loss_batch(
                     old_log_probs,
