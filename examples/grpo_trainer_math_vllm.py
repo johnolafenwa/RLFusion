@@ -13,17 +13,6 @@ def main() -> None:
         seed=123,
     )
     eval_dataset = AIME2025()
-    evaluator = Evaluator(
-        model="Qwen/Qwen2.5-0.5B-Instruct",
-        dataset=eval_dataset,
-        output_dir="./outputs/grpo_intellect_math_vllm/eval",
-        num_batches=1,
-        engine="vllm",
-        vllm_args={"tensor_parallel_size": 1},
-        max_new_tokens=64,
-        batch_size=1,
-    )
-
     trainer = GRPOTrainer(
         model="Qwen/Qwen2.5-0.5B-Instruct",
         train_dataset=train_dataset,
@@ -31,7 +20,7 @@ def main() -> None:
         saving_steps=5,
         logging_steps=1,
         eval_steps=1,
-        evaluator=evaluator,
+        eval_dataset=eval_dataset,
         enable_wandb=False,
         sampling_temperature=0.7,
         kl_penalty=0.0,
@@ -46,6 +35,18 @@ def main() -> None:
     )
 
     trainer.train()
+    if trainer._is_main_process():
+        evaluator = Evaluator(
+            model="./outputs/grpo_intellect_math_vllm/final",
+            dataset=eval_dataset,
+            output_dir="./outputs/grpo_intellect_math_vllm/eval",
+            num_batches=1,
+            engine="vllm",
+            vllm_args={"tensor_parallel_size": 1},
+            max_new_tokens=64,
+            batch_size=1,
+        )
+        evaluator.evaluate()
 
 
 if __name__ == "__main__":

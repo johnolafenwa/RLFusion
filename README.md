@@ -1,5 +1,5 @@
 # RLFusion
-Minimalist post-training utilities for LLMs with a focus on clarity and speed.
+Minimalist post-training utilities for LLMs with a focus on clarity and ease of learning.
 
 ## Features
 - SFT with role-aware masking (mask non-assistant tokens, train assistant tokens)
@@ -59,7 +59,7 @@ accelerate launch --num_processes 2 your_script.py
 Notes:
 - `batch_size` is per-process; effective batch size is `batch_size * num_processes`.
 - Logging, evaluation, and checkpoint saving are handled on the main process (rank 0).
-- If your `Evaluator` uses `engine="vllm"`, it runs on the main process and uses whatever GPUs are visible to that process.
+- Reward-based evaluation (`eval_steps` + `eval_dataset`) runs on the main process.
 
 ## Core Concepts
 ### Environment
@@ -79,7 +79,7 @@ env = EnvBase(
 
 ## Trainers
 ### SFT
-`SFTTrainer` consumes `(prompt, answer)` and masks non-assistant tokens while training assistant tokens. To evaluate during training, set `eval_steps` and pass an `Evaluator`.
+`SFTTrainer` consumes `(prompt, answer)` and masks non-assistant tokens while training assistant tokens. To evaluate during training, set `eval_steps` and pass an `eval_dataset` of environments with `get_reward`.
 
 ```python
 from torch.utils.data import Dataset
@@ -119,21 +119,14 @@ trainer.train()
 ```
 
 ### RLVR (GRPO)
-`GRPOTrainer` samples completions from the model, computes rewards via the environment, and optimizes a GRPO objective. To evaluate during training, set `eval_steps` and pass an `Evaluator`.
+`GRPOTrainer` samples completions from the model, computes rewards via the environment, and optimizes a GRPO objective. To evaluate during training, set `eval_steps` and pass an `eval_dataset` of environments with `get_reward`.
 
 ```python
 from rlfusion.datasets import MathDataset
-from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.trainers.grpo_trainer import GRPOTrainer
 
 train_dataset = MathDataset(num_samples=200, min_val=0, max_val=50, operand="add")
 eval_dataset = MathDataset(num_samples=50, min_val=0, max_val=50, operand="add")
-evaluator = Evaluator(
-    model="Qwen/Qwen2.5-0.5B-Instruct",
-    dataset=eval_dataset,
-    output_dir="./outputs/grpo_eval",
-    num_batches=1,
-)
 
 trainer = GRPOTrainer(
     model="Qwen/Qwen2.5-0.5B-Instruct",
@@ -142,7 +135,7 @@ trainer = GRPOTrainer(
     saving_steps=2,
     logging_steps=1,
     eval_steps=1,
-    evaluator=evaluator,
+    eval_dataset=eval_dataset,
     group_size=2,
     ppo_steps=1,
     max_new_tokens=64,
@@ -150,27 +143,15 @@ trainer = GRPOTrainer(
 trainer.train()
 ```
 
-To use vLLM for evaluation, add:
-```python
-evaluator = Evaluator(..., engine="vllm", vllm_args={"tensor_parallel_size": 1})
-```
-
 ### On-policy Distillation
-`OnPolicyDistillationTrainer` samples from the student and minimizes reverse KL to a fixed teacher distribution over completion tokens. To evaluate during training, set `eval_steps` and pass an `Evaluator`.
+`OnPolicyDistillationTrainer` samples from the student and minimizes reverse KL to a fixed teacher distribution over completion tokens. To evaluate during training, set `eval_steps` and pass an `eval_dataset` of environments with `get_reward`.
 
 ```python
 from rlfusion.datasets import MathDataset
-from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.trainers.onpolicy_distillation_trainer import OnPolicyDistillationTrainer
 
 train_dataset = MathDataset(num_samples=200, min_val=0, max_val=50, operand="add")
 eval_dataset = MathDataset(num_samples=50, min_val=0, max_val=50, operand="add")
-evaluator = Evaluator(
-    model="Qwen/Qwen2.5-0.5B-Instruct",
-    dataset=eval_dataset,
-    output_dir="./outputs/onpolicy_eval",
-    num_batches=1,
-)
 
 trainer = OnPolicyDistillationTrainer(
     model="Qwen/Qwen2.5-0.5B-Instruct",
@@ -180,15 +161,10 @@ trainer = OnPolicyDistillationTrainer(
     saving_steps=2,
     logging_steps=1,
     eval_steps=1,
-    evaluator=evaluator,
+    eval_dataset=eval_dataset,
     max_new_tokens=64,
 )
 trainer.train()
-```
-
-To use vLLM for evaluation, add:
-```python
-evaluator = Evaluator(..., engine="vllm", vllm_args={"tensor_parallel_size": 1})
 ```
 
 ## Training Guides

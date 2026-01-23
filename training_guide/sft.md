@@ -13,6 +13,8 @@ Recommended starting point:
 Notes:
 - If loss diverges, lower the learning rate or reduce max sequence length.
 - If you want to train on prompts too, set `mask_prompt=False`.
+- For eval during training, `eval_dataset` items must implement `get_reward`.
+- Eval metrics are reward-based even though training optimizes token-level loss.
 
 ## Distributed Training (Accelerate)
 To run SFT on multiple GPUs:
@@ -26,4 +28,4 @@ accelerate launch --num_processes 2 examples/sft_trainer_example.py
 
 Notes:
 - `batch_size` is per-process; effective batch size is `batch_size * num_processes`.
-- Checkpoints and evaluation (when `eval_steps` + `evaluator` are set) run on the main process.
+- Checkpoints and evaluation (when `eval_steps` + `eval_dataset` are set) run on the main process.

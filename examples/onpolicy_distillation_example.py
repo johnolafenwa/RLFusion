@@ -1,7 +1,6 @@
 import logging
 
 from rlfusion.datasets.rlvr import MathDataset
-from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.trainers.onpolicy_distillation_trainer import OnPolicyDistillationTrainer
 
 
@@ -21,15 +20,7 @@ def main() -> None:
         saving_steps=5,
         logging_steps=1,
         eval_steps=1,
-        evaluator=Evaluator(
-            model="Qwen/Qwen2.5-0.5B-Instruct",
-            dataset=dataset,
-            output_dir="./outputs/onpolicy_distill_math/eval",
-            num_batches=1,
-            engine="hf",
-            max_new_tokens=64,
-            batch_size=1,
-        ),
+        eval_dataset=dataset,
         enable_wandb=False,
         sampling_temperature=0.7,
         output_dir="./outputs/onpolicy_distill_math",

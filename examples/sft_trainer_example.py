@@ -4,7 +4,6 @@ from torch.utils.data import Dataset
 
 from rlfusion.envs import EnvBase
 from rlfusion.datasets.rlvr import MathDataset
-from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.trainers.sft_trainer import SFTTrainer
 
 
@@ -51,15 +50,7 @@ def main() -> None:
         saving_steps=2,
         logging_steps=1,
         eval_steps=10,
-        evaluator=Evaluator(
-            model="Qwen/Qwen2.5-0.5B-Instruct",
-            dataset=eval_dataset,
-            output_dir="./outputs/sft_example/eval",
-            num_batches=1,
-            engine="hf",
-            max_new_tokens=64,
-            batch_size=1,
-        ),
+        eval_dataset=eval_dataset,
         enable_wandb=False,
         output_dir="./outputs/sft_example",
         log_level=logging.INFO,

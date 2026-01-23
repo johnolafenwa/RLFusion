@@ -1,7 +1,6 @@
 import logging
 
 from rlfusion.datasets import IntellectMathDataset
-from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.trainers.grpo_trainer import GRPOTrainer
 
 
@@ -24,16 +23,7 @@ def main() -> None:
         saving_steps=5,
         logging_steps=1,
         eval_steps=1,
-        evaluator=Evaluator(
-            model="Qwen/Qwen2.5-0.5B-Instruct",
-            dataset=eval_dataset,
-            output_dir="./outputs/grpo_intellect_math/eval",
-            num_batches=1,
-            engine="hf",
-            generation_args={"top_p": 0.9},
-            max_new_tokens=128,
-            batch_size=1,
-        ),
+        eval_dataset=eval_dataset,
         enable_wandb=False,
         sampling_temperature=0.7,
         kl_penalty=0.0,

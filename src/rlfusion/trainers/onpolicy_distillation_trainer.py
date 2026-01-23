@@ -21,7 +21,6 @@ else:
 
 from transformers import AutoTokenizer
 
-from rlfusion.evaluation.evaluator import Evaluator
 from rlfusion.envs import EnvBase
 from rlfusion.inference.hf_utils import sample_completions_batch_hf
 from rlfusion.trainers.utils import (
@@ -50,6 +49,7 @@ class OnPolicyDistillationTrainer:
         saving_steps: int = 10,
         logging_steps: int = 10,
         eval_steps: Optional[int] = None,
+        eval_dataset: Optional[Sequence[EnvBase]] = None,
         enable_wandb: bool = False,
         wandb_project: str = "onpolicy_distill",
         wandb_run_name: Optional[str] = None,
@@ -69,7 +69,6 @@ class OnPolicyDistillationTrainer:
         max_log_chars: Optional[int] = 320,
         max_grad_norm: Optional[float] = None,
         log_level: int = logging.INFO,
-        evaluator: Optional[Evaluator] = None,
         use_accelerate: bool = False,
     ):
         self.accelerator = None
@@ -99,10 +98,8 @@ class OnPolicyDistillationTrainer:
 
         if eval_steps is not None and eval_steps <= 0:
             raise ValueError("eval_steps must be >= 1 or None.")
-        if eval_steps is not None and evaluator is None:
-            raise ValueError("evaluator is required when eval_steps is set.")
         self.eval_steps = eval_steps
-        self.evaluator = evaluator
+        self.eval_dataset = eval_dataset
 
         device = get_device()
         if device == "cuda":
@@ -169,7 +166,7 @@ class OnPolicyDistillationTrainer:
                         "batch_size": batch_size,
                         "ppo_steps": ppo_steps,
                         "clip_eps": clip_eps,
-                        "use_evaluator": evaluator is not None,
+                        "use_eval_dataset": eval_dataset is not None,
                     },
                 )
                 self._wandb = wandb
@@ -213,42 +210,6 @@ class OnPolicyDistillationTrainer:
         if self.accelerator is None:
             return self.model
         return cast(torch.nn.Module, self.accelerator.unwrap_model(self.model))
-
-    def _evaluate_with_evaluator(self, step: int) -> dict[str, float]:
-        if self.evaluator is None:
-            raise RuntimeError("Evaluator is not set.")
-
-        if self.evaluator.engine == "hf":
-            metrics: dict[str, float] = {}
-            if self._is_main_process():
-                model = cast(Any, self._unwrap_model_for_saving())
-                metrics = self.evaluator.evaluate_with_model(
-                    model=model, tokenizer=self.evaluator.tokenizer
-                )
-            if self.accelerator is not None:
-                self.accelerator.wait_for_everyone()
-            if not self._is_main_process():
-                return {}
-        else:
-            model_dir = self.output_dir / "eval_latest"
-            model_dir.mkdir(parents=True, exist_ok=True)
-            if self._is_main_process():
-                model = cast(Any, self._unwrap_model_for_saving())
-                model.save_pretrained(model_dir)
-                self.tokenizer.save_pretrained(model_dir)
-            if self.accelerator is not None:
-                self.accelerator.wait_for_everyone()
-
-            if not self._is_main_process():
-                return {}
-
-            self.evaluator.set_model(str(model_dir))
-            metrics = self.evaluator.evaluate()
-
-        if self._wandb is not None:
-            self._wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=step)
-
-        return metrics
 
     def sample_completions_batch(
         self, envs: List[EnvBase]
@@ -396,8 +357,11 @@ class OnPolicyDistillationTrainer:
         dataset_len = len(self.train_dataset)
         if dataset_len == 0:
             raise ValueError("Dataset is empty.")
-        if self.eval_steps is not None and self.evaluator is None:
-            raise ValueError("evaluator is required when eval_steps is set.")
+        if self.eval_steps is not None:
+            if self.eval_dataset is None:
+                raise ValueError("eval_dataset is required when eval_steps is set.")
+            if len(self.eval_dataset) == 0:
+                raise ValueError("Eval dataset is empty.")
 
         self.model.train()
         self.teacher_model.eval()
@@ -467,7 +431,10 @@ class OnPolicyDistillationTrainer:
                 )
 
             if self.eval_steps is not None and (step + 1) % self.eval_steps == 0:
-                self._evaluate_with_evaluator(step=step + 1)
+                if self._is_main_process():
+                    self.test(dataset=self.eval_dataset, step=step + 1)
+                if self.accelerator is not None:
+                    self.accelerator.wait_for_everyone()
 
             if (step + 1) % self.saving_steps == 0:
                 step_output_dir = self.output_dir / f"step_{step + 1}"

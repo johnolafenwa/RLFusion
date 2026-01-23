@@ -16,8 +16,8 @@ Recommended starting point:
 Notes:
 - Increase `group_size` for more stable advantage estimates.
 - If outputs collapse, increase `kl_penalty` slightly.
-- Set `eval_steps` and pass an `Evaluator` to run evaluation during training.
-- vLLM is supported in the `Evaluator` via `engine="vllm"` and optional `vllm_args`.
+- Set `eval_steps` and pass an `eval_dataset` to run reward evaluation during training.
+- `eval_dataset` items must implement `get_reward`.
 
 ## Distributed Training (Accelerate)
 To run GRPO on multiple GPUs:
@@ -31,4 +31,4 @@ accelerate launch --num_processes 2 examples/grpo_trainer_math.py
 
 Notes:
 - `batch_size` and `group_size` are per-process; effective sample throughput scales with `num_processes`.
-- Checkpoints and evaluation (when `eval_steps` + `evaluator` are set) run on the main process.
+- Checkpoints and evaluation (when `eval_steps` + `eval_dataset` are set) run on the main process.

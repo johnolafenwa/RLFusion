@@ -20,7 +20,8 @@ else:
 
 from transformers import AutoTokenizer
 
-from rlfusion.evaluation.evaluator import Evaluator
+from rlfusion.envs import EnvBase
+from rlfusion.inference.hf_utils import sample_completions_batch_hf
 from rlfusion.trainers.utils import get_device, set_seed, configure_torch_backends, resolve_attention_implementation
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,11 @@ class SFTTrainer:
         saving_steps: int = 10,
         logging_steps: int = 10,
         eval_steps: Optional[int] = None,
+        eval_dataset: Optional[Sequence[EnvBase]] = None,
+        max_new_tokens: int = 256,
+        do_sample: bool = True,
+        sampling_temperature: float = 1.0,
+        generation_args: Optional[dict[str, Any]] = None,
         enable_wandb: bool = False,
         wandb_project: str = "sft",
         wandb_run_name: Optional[str] = None,
@@ -54,7 +60,6 @@ class SFTTrainer:
         assistant_loss_mode: Literal["all", "last"] = "all",
         max_grad_norm: Optional[float] = None,
         log_level: int = logging.INFO,
-        evaluator: Optional[Evaluator] = None,
         use_accelerate: bool = False,
     ):
         self.accelerator = None
@@ -82,10 +87,12 @@ class SFTTrainer:
 
         if eval_steps is not None and eval_steps <= 0:
             raise ValueError("eval_steps must be >= 1 or None.")
-        if eval_steps is not None and evaluator is None:
-            raise ValueError("evaluator is required when eval_steps is set.")
         self.eval_steps = eval_steps
-        self.evaluator = evaluator
+        self.eval_dataset = eval_dataset
+        self.max_new_tokens = max_new_tokens
+        self.do_sample = do_sample
+        self.sampling_temperature = sampling_temperature
+        self.generation_args = generation_args or {}
 
         device = get_device()
         if device == "cuda":
@@ -117,6 +124,7 @@ class SFTTrainer:
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
 
         self._wandb = None
         should_enable_wandb = enable_wandb and (
@@ -146,9 +154,10 @@ class SFTTrainer:
                         "dtype": str(self.model.dtype),
                         "seed": seed,
                         "max_seq_len": max_seq_len,
+                        "max_new_tokens": max_new_tokens,
                         "mask_prompt": mask_prompt,
                         "assistant_loss_mode": assistant_loss_mode,
-                        "use_evaluator": evaluator is not None,
+                        "use_eval_dataset": eval_dataset is not None,
                     },
                 )
                 self._wandb = wandb
@@ -193,41 +202,27 @@ class SFTTrainer:
             return self.model
         return cast(torch.nn.Module, self.accelerator.unwrap_model(self.model))
 
-    def _evaluate_with_evaluator(self, step: int) -> dict[str, float]:
-        if self.evaluator is None:
-            raise RuntimeError("Evaluator is not set.")
+    def sample_completions_batch(
+        self, envs: list[EnvBase]
+    ) -> Tuple[torch.Tensor, list[str], list[int], list[int]]:
+        model = cast(Any, self.model)
+        return sample_completions_batch_hf(
+            model=model,
+            tokenizer=self.tokenizer,
+            envs=envs,
+            do_sample=self.do_sample,
+            sampling_temperature=self.sampling_temperature,
+            max_new_tokens=self.max_new_tokens,
+            generation_args=self.generation_args,
+        )
 
-        if self.evaluator.engine == "hf":
-            metrics: dict[str, float] = {}
-            if self._is_main_process():
-                model = cast(Any, self._unwrap_model_for_saving())
-                metrics = self.evaluator.evaluate_with_model(
-                    model=model, tokenizer=self.evaluator.tokenizer
-                )
-            if self.accelerator is not None:
-                self.accelerator.wait_for_everyone()
-            if not self._is_main_process():
-                return {}
-        else:
-            model_dir = self.output_dir / "eval_latest"
-            model_dir.mkdir(parents=True, exist_ok=True)
-            if self._is_main_process():
-                model = cast(Any, self._unwrap_model_for_saving())
-                model.save_pretrained(model_dir)
-                self.tokenizer.save_pretrained(model_dir)
-            if self.accelerator is not None:
-                self.accelerator.wait_for_everyone()
-
-            if not self._is_main_process():
-                return {}
-
-            self.evaluator.set_model(str(model_dir))
-            metrics = self.evaluator.evaluate()
-
-        if self._wandb is not None:
-            self._wandb.log({f"eval/{k}": v for k, v in metrics.items()}, step=step)
-
-        return metrics
+    def _compute_reward(self, env: EnvBase, completion_text: Optional[str]) -> float:
+        if completion_text is None:
+            return 0.0
+        reward_value = env.get_reward(completion_text)
+        if reward_value is None:
+            return 0.0
+        return float(reward_value)
 
     def _extract_sample(self, sample: Any) -> Tuple[list[dict[str, object]], Optional[str]]:
         if isinstance(sample, dict):
@@ -342,8 +337,11 @@ class SFTTrainer:
         dataset_len = len(self.train_dataset)
         if dataset_len == 0:
             raise ValueError("Dataset is empty.")
-        if self.eval_steps is not None and self.evaluator is None:
-            raise ValueError("evaluator is required when eval_steps is set.")
+        if self.eval_steps is not None:
+            if self.eval_dataset is None:
+                raise ValueError("eval_dataset is required when eval_steps is set.")
+            if len(self.eval_dataset) == 0:
+                raise ValueError("Eval dataset is empty.")
 
         self.model.train()
 
@@ -397,7 +395,10 @@ class SFTTrainer:
                     )
 
             if self.eval_steps is not None and (step + 1) % self.eval_steps == 0:
-                self._evaluate_with_evaluator(step=step + 1)
+                if self._is_main_process():
+                    self.test(dataset=self.eval_dataset, step=step + 1)
+                if self.accelerator is not None:
+                    self.accelerator.wait_for_everyone()
 
             if (step + 1) % self.saving_steps == 0:
                 step_output_dir = self.output_dir / f"step_{step + 1}"
@@ -425,7 +426,7 @@ class SFTTrainer:
 
     def test(
         self,
-        dataset: Optional[Sequence[Any]] = None,
+        dataset: Optional[Sequence[EnvBase]] = None,
         num_batches: Optional[int] = None,
         step: Optional[int] = None,
     ) -> dict:
@@ -444,58 +445,37 @@ class SFTTrainer:
             else:
                 indices = [random.randint(0, dataset_len - 1) for _ in range(num_batches * self.batch_size)]
 
-            total_loss = 0.0
-            total_tokens = 0
-            batches = 0
+            all_rewards: list[float] = []
+            all_completion_lengths: list[int] = []
 
             for start in range(0, len(indices), self.batch_size):
                 batch_indices = indices[start : start + self.batch_size]
-                batch_samples = [eval_dataset[i] for i in batch_indices]
+                env_batch = [eval_dataset[i] for i in batch_indices]
 
-                prompts = []
-                responses = []
-                for sample in batch_samples:
-                    prompt, response = self._extract_sample(sample)
-                    prompts.append(prompt)
-                    responses.append(None if response is None else str(response))
+                _, texts, _, completion_lens = self.sample_completions_batch(env_batch)
+                rewards = [self._compute_reward(env, text) for env, text in zip(env_batch, texts)]
+                all_rewards.extend(rewards)
+                all_completion_lengths.extend(completion_lens)
 
-                input_ids, attention_mask, labels = self._build_batch(prompts, responses)
-
-                model_device = next(self.model.parameters()).device
-                input_ids = input_ids.to(model_device)
-                attention_mask = attention_mask.to(model_device)
-                labels = labels.to(model_device)
-
-                with torch.no_grad():
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels,
-                    )
-                    loss = outputs.loss
-
-                token_count = int((labels != -100).sum().item())
-                if token_count > 0:
-                    total_loss += float(loss.item()) * token_count
-                    total_tokens += token_count
-                batches += 1
-
-            avg_loss = total_loss / max(total_tokens, 1)
-            perplexity = float(torch.exp(torch.tensor(avg_loss)).item())
+            rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32)
+            reward_mean = float(rewards_tensor.mean().item())
+            reward_std = float(rewards_tensor.std(unbiased=False).item())
+            completion_tokens_mean = float(
+                torch.tensor(all_completion_lengths, dtype=torch.float32).mean().item()
+            )
 
             logger.info(
-                "eval loss=%.6f perplexity=%.4f tokens=%d batches=%d",
-                avg_loss,
-                perplexity,
-                total_tokens,
-                batches,
+                "eval reward_mean=%.4f reward_std=%.4f completion_tokens_mean=%.1f",
+                reward_mean,
+                reward_std,
+                completion_tokens_mean,
             )
 
             if self._wandb is not None:
                 log_data = {
-                    "eval/loss": avg_loss,
-                    "eval/perplexity": perplexity,
-                    "eval/tokens": total_tokens,
+                    "eval/reward_mean": reward_mean,
+                    "eval/reward_std": reward_std,
+                    "eval/completion_tokens_mean": completion_tokens_mean,
                 }
                 if step is not None:
                     self._wandb.log(log_data, step=step)
@@ -503,10 +483,9 @@ class SFTTrainer:
                     self._wandb.log(log_data)
 
             return {
-                "loss": avg_loss,
-                "perplexity": perplexity,
-                "tokens": total_tokens,
-                "batches": batches,
+                "reward_mean": reward_mean,
+                "reward_std": reward_std,
+                "completion_tokens_mean": completion_tokens_mean,
             }
         finally:
             self.model.train()
