@@ -143,7 +143,7 @@ class GRPOTrainer():
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "left"
+        self.tokenizer.padding_side = "right"
 
         if kl_penalty > 0.0:
             self.ref_model = AutoModelForCausalLM.from_pretrained(
