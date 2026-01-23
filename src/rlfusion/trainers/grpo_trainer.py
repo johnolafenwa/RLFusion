@@ -146,12 +146,7 @@ class GRPOTrainer():
         self.tokenizer.padding_side = "right"
 
         if kl_penalty > 0.0:
-            self.ref_model = AutoModelForCausalLM.from_pretrained(
-                model,
-                device_map=device_map,
-                attn_implementation=attn_implementation,
-                dtype=torch.bfloat16
-            )
+            self.ref_model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
 
             self.ref_model.config.use_cache = False
             self.ref_model.eval()
