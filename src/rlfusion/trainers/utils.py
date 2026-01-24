@@ -1,6 +1,6 @@
 import importlib.util
 import random
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -62,3 +62,30 @@ def format_prompt(prompt: list[dict]) -> str:
         content = msg.get("content", "")
         parts.append(f"{role}: {content}")
     return " | ".join(parts)
+
+
+def build_full_attention_mask(
+    input_attention_mask: torch.Tensor,
+    completion_lengths: Sequence[int],
+    sequence_ids: torch.Tensor,
+) -> torch.Tensor:
+    if input_attention_mask.ndim == 1:
+        input_attention_mask = input_attention_mask.unsqueeze(0)
+    if input_attention_mask.shape[0] != sequence_ids.shape[0]:
+        raise ValueError("input_attention_mask must match batch size.")
+    if len(completion_lengths) != sequence_ids.shape[0]:
+        raise ValueError("completion_lengths must match batch size.")
+    if input_attention_mask.shape[1] > sequence_ids.shape[1]:
+        raise ValueError("input_attention_mask exceeds sequence length.")
+
+    input_attention_mask = input_attention_mask.to(sequence_ids.device)
+    full_mask = torch.zeros_like(sequence_ids, dtype=torch.long)
+    input_len = int(input_attention_mask.shape[1])
+    full_mask[:, :input_len] = input_attention_mask.long()
+
+    for idx, completion_len in enumerate(completion_lengths):
+        end = min(input_len + int(completion_len), sequence_ids.shape[1])
+        if end > input_len:
+            full_mask[idx, input_len:end] = 1
+
+    return full_mask

@@ -30,7 +30,9 @@ from rlfusion.trainers.utils import (
     truncate_text,
     format_prompt,
     resolve_attention_implementation,
+    build_full_attention_mask,
 )
+from rlfusion.trainers.common import configure_logging, is_main_process, unwrap_model_for_saving
 from rlfusion.envs import EnvBase
 
 logger = logging.getLogger(__name__)
@@ -229,20 +231,13 @@ class GRPOTrainer():
 
 
     def _configure_logging(self, log_level: int) -> None:
-        if not logging.getLogger().handlers:
-            logging.basicConfig(
-                level=log_level,
-                format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-            )
-        logger.setLevel(log_level)
+        configure_logging(logger, log_level)
 
     def _is_main_process(self) -> bool:
-        return self.accelerator is None or bool(self.accelerator.is_main_process)
+        return is_main_process(self.accelerator)
 
     def _unwrap_model_for_saving(self) -> torch.nn.Module:
-        if self.accelerator is None:
-            return self.model
-        return cast(torch.nn.Module, self.accelerator.unwrap_model(self.model))
+        return unwrap_model_for_saving(self.model, self.accelerator)
 
     def sample_completions_batch(self, envs: List[EnvBase]) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
         model = cast(Any, self.model)
@@ -299,26 +294,7 @@ class GRPOTrainer():
         completion_lengths: List[int],
         sequence_ids: torch.Tensor,
     ) -> torch.Tensor:
-        if input_attention_mask.ndim == 1:
-            input_attention_mask = input_attention_mask.unsqueeze(0)
-        if input_attention_mask.shape[0] != sequence_ids.shape[0]:
-            raise ValueError("input_attention_mask must match batch size.")
-        if len(completion_lengths) != sequence_ids.shape[0]:
-            raise ValueError("completion_lengths must match batch size.")
-        if input_attention_mask.shape[1] > sequence_ids.shape[1]:
-            raise ValueError("input_attention_mask exceeds sequence length.")
-
-        input_attention_mask = input_attention_mask.to(sequence_ids.device)
-        full_mask = torch.zeros_like(sequence_ids, dtype=torch.long)
-        input_len = int(input_attention_mask.shape[1])
-        full_mask[:, :input_len] = input_attention_mask.long()
-
-        for idx, completion_len in enumerate(completion_lengths):
-            end = min(input_len + int(completion_len), sequence_ids.shape[1])
-            if end > input_len:
-                full_mask[idx, input_len:end] = 1
-
-        return full_mask
+        return build_full_attention_mask(input_attention_mask, completion_lengths, sequence_ids)
 
     def get_log_probs(
         self,

@@ -22,6 +22,7 @@ from transformers import AutoTokenizer
 
 from rlfusion.envs import EnvBase
 from rlfusion.inference.hf_utils import sample_completions_batch_hf
+from rlfusion.trainers.common import configure_logging, is_main_process, unwrap_model_for_saving
 from rlfusion.trainers.utils import get_device, set_seed, configure_torch_backends, resolve_attention_implementation
 
 logger = logging.getLogger(__name__)
@@ -187,20 +188,13 @@ class SFTTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _configure_logging(self, log_level: int) -> None:
-        if not logging.getLogger().handlers:
-            logging.basicConfig(
-                level=log_level,
-                format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-            )
-        logger.setLevel(log_level)
+        configure_logging(logger, log_level)
 
     def _is_main_process(self) -> bool:
-        return self.accelerator is None or bool(self.accelerator.is_main_process)
+        return is_main_process(self.accelerator)
 
     def _unwrap_model_for_saving(self) -> torch.nn.Module:
-        if self.accelerator is None:
-            return self.model
-        return cast(torch.nn.Module, self.accelerator.unwrap_model(self.model))
+        return unwrap_model_for_saving(self.model, self.accelerator)
 
     def sample_completions_batch(
         self, envs: list[EnvBase]
