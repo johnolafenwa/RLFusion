@@ -41,7 +41,6 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
-    # Expected: reverse_kl stats during training.
     trainer.train()
 
 

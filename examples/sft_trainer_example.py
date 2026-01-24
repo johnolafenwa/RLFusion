@@ -61,7 +61,6 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
-    # Expected: training logs include step losses and periodic eval reward stats.
     trainer.train()
 
 

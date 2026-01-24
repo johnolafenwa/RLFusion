@@ -42,7 +42,6 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
-    # Expected: reward stats logged each step.
     trainer.train()
 
 

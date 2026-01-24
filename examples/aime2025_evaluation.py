@@ -26,7 +26,6 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
-    # Expected: evaluation logs include reward_mean and completion_tokens_mean.
     evaluator.evaluate()
 
 

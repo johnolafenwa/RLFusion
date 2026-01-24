@@ -36,9 +36,7 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
-    # Expected: reverse_kl and loss stats are logged each step.
     trainer.train()
-
 
 if __name__ == "__main__":
     main()

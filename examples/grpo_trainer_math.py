@@ -37,7 +37,6 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
-    # Expected: reward_mean, ratio stats, and completion previews in logs.
     trainer.train()
 
 
