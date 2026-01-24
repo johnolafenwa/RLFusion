@@ -1,6 +1,7 @@
 """Supervised fine-tuning trainer with chat-template masking utilities."""
 
 import importlib
+import math
 import logging
 import random
 from collections.abc import Sequence
@@ -212,12 +213,12 @@ class SFTTrainer:
             generation_args=self.generation_args,
         )
 
-    def _compute_reward(self, env: EnvBase, completion_text: Optional[str]) -> float:
+    def _compute_reward(self, env: EnvBase, completion_text: Optional[str]) -> Optional[float]:
         if completion_text is None:
-            return 0.0
+            return None
         reward_value = env.get_reward(completion_text)
         if reward_value is None:
-            return 0.0
+            return None
         return float(reward_value)
 
     def _extract_sample(self, sample: Any) -> Tuple[list[dict[str, object]], Optional[str]]:
@@ -281,11 +282,17 @@ class SFTTrainer:
 
         return full_ids, spans
 
-    def _build_batch(self, prompts: Iterable[Any], responses: Iterable[Optional[str]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _build_batch(
+        self,
+        prompts: Iterable[Any],
+        responses: Iterable[Optional[str]],
+        mask_prompt: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_input_ids: list[list[int]] = []
         batch_attention_mask: list[list[int]] = []
         batch_labels: list[list[int]] = []
 
+        use_mask_prompt = self.mask_prompt if mask_prompt is None else mask_prompt
         for prompt, response in zip(prompts, responses):
             prompt = self._normalize_prompt(prompt)
 
@@ -293,9 +300,9 @@ class SFTTrainer:
             if response is not None:
                 messages.append({"role": "assistant", "content": response})
             input_ids, spans = self._chat_template_message_spans(messages)
-            labels = list(input_ids) if not self.mask_prompt else [-100] * len(input_ids)
+            labels = list(input_ids) if not use_mask_prompt else [-100] * len(input_ids)
 
-            if self.mask_prompt:
+            if use_mask_prompt:
                 # Train only assistant tokens to avoid learning the prompt format.
                 assistant_spans = [(s, e) for s, e, r in spans if r == "assistant"]
                 if not assistant_spans:
@@ -444,6 +451,8 @@ class SFTTrainer:
 
             all_rewards: list[float] = []
             all_completion_lengths: list[int] = []
+            total_loss = 0.0
+            total_tokens = 0
 
             for start in range(0, len(indices), self.batch_size):
                 batch_indices = indices[start : start + self.batch_size]
@@ -451,38 +460,94 @@ class SFTTrainer:
 
                 _, texts, _, completion_lens = self.sample_completions_batch(env_batch)
                 rewards = [self._compute_reward(env, text) for env, text in zip(env_batch, texts)]
-                all_rewards.extend(rewards)
+                valid_rewards = [reward for reward in rewards if reward is not None]
+                all_rewards.extend(valid_rewards)
                 all_completion_lengths.extend(completion_lens)
 
-            rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32)
-            reward_mean = float(rewards_tensor.mean().item())
-            reward_std = float(rewards_tensor.std(unbiased=False).item())
+                prompts = []
+                responses = []
+                for sample in env_batch:
+                    prompt, response = self._extract_sample(sample)
+                    if response is None and not any(msg["role"] == "assistant" for msg in prompt):
+                        continue
+                    prompts.append(prompt)
+                    responses.append(response)
+
+                if prompts:
+                    input_ids, attention_mask, labels = self._build_batch(
+                        prompts, responses, mask_prompt=True
+                    )
+                    model_device = next(self.model.parameters()).device
+                    input_ids = input_ids.to(model_device)
+                    attention_mask = attention_mask.to(model_device)
+                    labels = labels.to(model_device)
+                    outputs = self.model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        labels=labels,
+                    )
+                    token_count = int((labels != -100).sum().item())
+                    if token_count > 0:
+                        total_loss += float(outputs.loss.item()) * token_count
+                        total_tokens += token_count
+
+            reward_mean = None
+            reward_std = None
+            if all_rewards:
+                rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32)
+                reward_mean = float(rewards_tensor.mean().item())
+                reward_std = float(rewards_tensor.std(unbiased=False).item())
             completion_tokens_mean = float(
                 torch.tensor(all_completion_lengths, dtype=torch.float32).mean().item()
             )
+            ce_loss = None
+            perplexity = None
+            if total_tokens > 0:
+                ce_loss = total_loss / total_tokens
+                try:
+                    perplexity = float(math.exp(ce_loss))
+                except OverflowError:
+                    perplexity = float("inf")
 
             logger.info(
-                "eval reward_mean=%.4f reward_std=%.4f completion_tokens_mean=%.1f",
-                reward_mean,
-                reward_std,
+                "eval completion_tokens_mean=%.1f ce_loss=%s perplexity=%s",
                 completion_tokens_mean,
+                "n/a" if ce_loss is None else f"{ce_loss:.6f}",
+                "n/a" if perplexity is None else f"{perplexity:.3f}",
             )
+            if reward_mean is not None and reward_std is not None:
+                logger.info(
+                    "eval reward_mean=%.4f reward_std=%.4f",
+                    reward_mean,
+                    reward_std,
+                )
 
             if self._wandb is not None:
                 log_data = {
-                    "eval/reward_mean": reward_mean,
-                    "eval/reward_std": reward_std,
                     "eval/completion_tokens_mean": completion_tokens_mean,
                 }
+                if ce_loss is not None:
+                    log_data["eval/ce_loss"] = ce_loss
+                if perplexity is not None:
+                    log_data["eval/perplexity"] = perplexity
+                if reward_mean is not None and reward_std is not None:
+                    log_data["eval/reward_mean"] = reward_mean
+                    log_data["eval/reward_std"] = reward_std
                 if step is not None:
                     self._wandb.log(log_data, step=step)
                 else:
                     self._wandb.log(log_data)
 
-            return {
-                "reward_mean": reward_mean,
-                "reward_std": reward_std,
+            results = {
                 "completion_tokens_mean": completion_tokens_mean,
             }
+            if ce_loss is not None:
+                results["ce_loss"] = ce_loss
+            if perplexity is not None:
+                results["perplexity"] = perplexity
+            if reward_mean is not None and reward_std is not None:
+                results["reward_mean"] = reward_mean
+                results["reward_std"] = reward_std
+            return results
         finally:
             self.model.train()
