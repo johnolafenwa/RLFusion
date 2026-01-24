@@ -1,3 +1,5 @@
+"""Supervised fine-tuning trainer with chat-template masking utilities."""
+
 import importlib
 import logging
 import random
@@ -294,6 +296,7 @@ class SFTTrainer:
             labels = list(input_ids) if not self.mask_prompt else [-100] * len(input_ids)
 
             if self.mask_prompt:
+                # Train only assistant tokens to avoid learning the prompt format.
                 assistant_spans = [(s, e) for s, e, r in spans if r == "assistant"]
                 if not assistant_spans:
                     raise ValueError("No assistant messages found; nothing to train on.")

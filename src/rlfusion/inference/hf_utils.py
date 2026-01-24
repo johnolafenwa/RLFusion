@@ -1,3 +1,5 @@
+"""HF generation helpers with consistent prompt/completion bookkeeping."""
+
 from __future__ import annotations
 
 from typing import Any, cast
@@ -5,7 +7,7 @@ from typing import Any, cast
 import torch
 
 from rlfusion.envs import EnvBase
-from rlfusion.trainers.types import GenerateOutput
+from rlfusion.trainers.types import AttentionMask, GenerateOutput, TokenIds
 
 
 def sample_completions_batch_hf(
@@ -18,8 +20,8 @@ def sample_completions_batch_hf(
     max_new_tokens: int,
     generation_args: dict[str, Any],
     return_attention_mask: bool = False,
-) -> tuple[torch.Tensor, list[str], list[int], list[int]] | tuple[
-    torch.Tensor, list[str], list[int], list[int], torch.Tensor
+) -> tuple[TokenIds, list[str], list[int], list[int]] | tuple[
+    TokenIds, list[str], list[int], list[int], AttentionMask
 ]:
     formatted_prompts = [
         tokenizer.apply_chat_template(
@@ -35,6 +37,7 @@ def sample_completions_batch_hf(
     input_ids = input_tokens["input_ids"].to(model_device)
     attention_mask = input_tokens["attention_mask"].to(model_device)
     input_length = int(input_ids.shape[1])
+    # True prompt lengths (no padding); padded length is input_length.
     prompt_lengths = attention_mask.sum(dim=1).tolist()
 
     gen_kwargs: dict[str, Any] = {

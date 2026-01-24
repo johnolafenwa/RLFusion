@@ -1,3 +1,8 @@
+"""Minimal SFT run.
+
+Expected: logs print `loss=...` every step and eval logs `reward_mean`.
+"""
+
 import logging
 
 from torch.utils.data import Dataset
@@ -56,6 +61,7 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
+    # Expected: training logs include step losses and periodic eval reward stats.
     trainer.train()
 
 

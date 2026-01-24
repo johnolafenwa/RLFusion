@@ -1,3 +1,8 @@
+"""On-policy distillation on IntellectMath with a held-out eval split.
+
+Expected: reverse_kl and loss stats in logs.
+"""
+
 import logging
 
 from rlfusion.datasets import IntellectMathDataset
@@ -36,6 +41,7 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
+    # Expected: reverse_kl stats during training.
     trainer.train()
 
 

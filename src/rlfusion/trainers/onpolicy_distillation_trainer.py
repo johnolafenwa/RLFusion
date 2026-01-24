@@ -1,3 +1,5 @@
+"""On-policy distillation trainer: student follows teacher via reverse KL."""
+
 import importlib
 import logging
 import random
@@ -23,6 +25,7 @@ from transformers import AutoTokenizer
 
 from rlfusion.envs import EnvBase
 from rlfusion.inference.hf_utils import sample_completions_batch_hf
+from rlfusion.trainers.types import AttentionMask, LogProbs, TokenIds
 from rlfusion.trainers.utils import (
     get_device,
     set_seed,
@@ -237,24 +240,25 @@ class OnPolicyDistillationTrainer:
 
     def _build_full_attention_mask(
         self,
-        input_attention_mask: torch.Tensor,
+        input_attention_mask: AttentionMask,
         completion_lengths: List[int],
-        sequence_ids: torch.Tensor,
-    ) -> torch.Tensor:
+        sequence_ids: TokenIds,
+    ) -> AttentionMask:
         return build_full_attention_mask(input_attention_mask, completion_lengths, sequence_ids)
 
     def get_log_probs(
         self,
-        sequence_ids: torch.Tensor,
+        sequence_ids: TokenIds,
         model: Optional[torch.nn.Module] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        attention_mask: Optional[AttentionMask] = None,
+    ) -> LogProbs:
         if sequence_ids.ndim == 1:
             sequence_ids = sequence_ids.unsqueeze(0)
         if model is None:
             model = self.model
 
         if attention_mask is None:
+            # Fall back to pad-based masking only when an explicit mask is unavailable.
             if self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id != self.tokenizer.eos_token_id:
                 attention_mask = (sequence_ids != self.tokenizer.pad_token_id).long()
             else:
@@ -402,6 +406,7 @@ class OnPolicyDistillationTrainer:
             sequences, texts, _prompt_lens, completion_lens, input_attention_mask = (
                 self._sample_completions_batch_with_mask(env_batch)
             )
+            # _prompt_lens are true prompt lengths; input_length is the padded generation boundary.
             full_attention_mask = self._build_full_attention_mask(
                 input_attention_mask, completion_lens, sequences
             )
@@ -416,6 +421,7 @@ class OnPolicyDistillationTrainer:
             masks = self._build_masks(mask_prompt_lens, completion_lens, sequences)
             mask_counts = masks.sum(dim=1).clamp_min(1.0)
             reverse_kl = (old_log_probs - teacher_log_probs) * masks
+            # Use negative reverse KL as an advantage signal to pull toward the teacher.
             advantages = -reverse_kl
 
             loss = None
@@ -542,6 +548,7 @@ class OnPolicyDistillationTrainer:
                     sequences, texts, _prompt_lens, completion_lens, input_attention_mask = (
                         self._sample_completions_batch_with_mask(env_batch)
                     )
+                    # _prompt_lens are true prompt lengths; input_length is the padded generation boundary.
                     full_attention_mask = self._build_full_attention_mask(
                         input_attention_mask, completion_lens, sequences
                     )

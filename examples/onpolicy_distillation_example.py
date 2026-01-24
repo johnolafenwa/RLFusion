@@ -1,3 +1,8 @@
+"""Minimal on-policy distillation run on the toy math dataset.
+
+Expected: logs show reverse_kl and loss values each step.
+"""
+
 import logging
 
 from rlfusion.datasets.rlvr import MathDataset
@@ -31,6 +36,7 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
+    # Expected: reverse_kl and loss stats are logged each step.
     trainer.train()
 
 

@@ -1,3 +1,8 @@
+"""Minimal GRPO run on the toy math dataset.
+
+Expected: logs show reward_mean/reward_std and PPO ratio stats.
+"""
+
 import logging
 
 from rlfusion.datasets.rlvr import MathDataset
@@ -32,6 +37,7 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
+    # Expected: reward_mean, ratio stats, and completion previews in logs.
     trainer.train()
 
 

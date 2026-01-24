@@ -1,3 +1,5 @@
+"""GRPO trainer: group sampling, advantage normalization, PPO-style updates."""
+
 import importlib
 import logging
 import random
@@ -23,6 +25,7 @@ from transformers import AutoTokenizer
 
 from rlfusion.inference.hf_utils import sample_completions_batch_hf
 from rlfusion.trainers.data import Trajectory
+from rlfusion.trainers.types import AttentionMask, LogProbs, TokenIds
 from rlfusion.trainers.utils import (
     get_device,
     set_seed,
@@ -286,28 +289,30 @@ class GRPOTrainer():
 
         for traj in trajectories:
             assert traj.reward is not None
+            # Normalize rewards to keep PPO updates numerically stable.
             traj.advantage = (traj.reward - mean_reward) / (std + eps)
 
     def _build_full_attention_mask(
         self,
-        input_attention_mask: torch.Tensor,
+        input_attention_mask: AttentionMask,
         completion_lengths: List[int],
-        sequence_ids: torch.Tensor,
-    ) -> torch.Tensor:
+        sequence_ids: TokenIds,
+    ) -> AttentionMask:
         return build_full_attention_mask(input_attention_mask, completion_lengths, sequence_ids)
 
     def get_log_probs(
         self,
-        sequence_ids: torch.Tensor,
+        sequence_ids: TokenIds,
         model: Optional[torch.nn.Module] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        attention_mask: Optional[AttentionMask] = None,
+    ) -> LogProbs:
         if sequence_ids.ndim == 1:
             sequence_ids = sequence_ids.unsqueeze(0)
         if model is None:
             model = self.model
 
         if attention_mask is None:
+            # Fall back to pad-based masking only when an explicit mask is unavailable.
             if self.tokenizer.pad_token_id is not None and self.tokenizer.pad_token_id != self.tokenizer.eos_token_id:
                 attention_mask = (sequence_ids != self.tokenizer.pad_token_id).long()
             else:
@@ -349,6 +354,7 @@ class GRPOTrainer():
         denom = mask.sum().clamp_min(1.0)
         kl = (new_log_probs - ref_log_probs) * mask
 
+        # KL penalty keeps the policy close to the reference when enabled.
         return -(obj.sum() / denom) + (kl_beta * (kl.sum() / denom))
 
     def grpo_loss_batch(self,
@@ -380,6 +386,7 @@ class GRPOTrainer():
         sequence_length = int(trajectory.sequence_ids.numel())
         mask = torch.zeros((sequence_length - 1,), device=trajectory.sequence_ids.device, dtype=torch.float32)
 
+        # Use padded input length when provided so the mask starts at the generation boundary.
         prompt_len = trajectory.prompt_len if input_length is None else int(input_length)
         completion_len = trajectory.completion_len
         if completion_len is None:
@@ -495,6 +502,7 @@ class GRPOTrainer():
             sequences, texts, prompt_lens, completion_lens, input_attention_mask = (
                 self._sample_completions_batch_with_mask(envs)
             )
+            # prompt_lens are true prompt lengths; input_length is the padded generation boundary.
 
             trajectories = []
             for i, env_instance in enumerate(envs):
@@ -511,6 +519,7 @@ class GRPOTrainer():
             self.compute_advantage(trajectories)
 
             input_length = int(input_attention_mask.shape[1])
+            # Build a full mask that keeps prompt padding holes but enables generated tokens.
             full_attention_mask = self._build_full_attention_mask(
                 input_attention_mask, completion_lens, sequences
             )

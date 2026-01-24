@@ -1,3 +1,8 @@
+"""On-policy distillation with a vLLM evaluator on the AIME dataset.
+
+Expected: training logs show reverse_kl; evaluation writes metrics.json.
+"""
+
 import logging
 
 from rlfusion.datasets import IntellectMathDataset
@@ -32,6 +37,7 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
+    # Expected: reverse_kl and loss stats during training; eval metrics saved.
     trainer.train()
     if trainer._is_main_process():
         evaluator = Evaluator(

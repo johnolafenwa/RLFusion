@@ -1,3 +1,5 @@
+"""Data containers used by trainer loops."""
+
 from dataclasses import dataclass
 from rlfusion.envs import EnvBase
 import torch

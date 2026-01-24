@@ -1,3 +1,5 @@
+"""vLLM loader utilities and sampling parameter translation."""
+
 from __future__ import annotations
 
 import importlib
@@ -58,4 +60,3 @@ def build_sampling_params(
             sampling_kwargs[key] = value
 
     return sampling_params_cls(**sampling_kwargs)
-

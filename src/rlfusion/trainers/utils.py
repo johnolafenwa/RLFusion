@@ -1,9 +1,13 @@
+"""Trainer utilities: device selection, seeding, formatting, mask helpers."""
+
 import importlib.util
 import random
 from typing import Optional, Sequence
 
 import numpy as np
 import torch
+
+from rlfusion.trainers.types import AttentionMask, TokenIds
 
 def get_device():
 
@@ -65,10 +69,10 @@ def format_prompt(prompt: list[dict]) -> str:
 
 
 def build_full_attention_mask(
-    input_attention_mask: torch.Tensor,
+    input_attention_mask: AttentionMask,
     completion_lengths: Sequence[int],
-    sequence_ids: torch.Tensor,
-) -> torch.Tensor:
+    sequence_ids: TokenIds,
+) -> AttentionMask:
     if input_attention_mask.ndim == 1:
         input_attention_mask = input_attention_mask.unsqueeze(0)
     if input_attention_mask.shape[0] != sequence_ids.shape[0]:
@@ -78,6 +82,7 @@ def build_full_attention_mask(
     if input_attention_mask.shape[1] > sequence_ids.shape[1]:
         raise ValueError("input_attention_mask exceeds sequence length.")
 
+    # Preserve prompt padding holes while marking only generated tokens as attendable.
     input_attention_mask = input_attention_mask.to(sequence_ids.device)
     full_mask = torch.zeros_like(sequence_ids, dtype=torch.long)
     input_len = int(input_attention_mask.shape[1])

@@ -1,3 +1,8 @@
+"""GRPO with a vLLM evaluator on the AIME dataset.
+
+Expected: training logs show reward stats; evaluation writes metrics.json.
+"""
+
 import logging
 
 from rlfusion.datasets import IntellectMathDataset
@@ -34,6 +39,7 @@ def main() -> None:
         use_accelerate=True,
     )
 
+    # Expected: reward stats per step; evaluator logs reward_mean.
     trainer.train()
     if trainer._is_main_process():
         evaluator = Evaluator(

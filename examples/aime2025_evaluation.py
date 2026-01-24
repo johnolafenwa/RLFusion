@@ -1,3 +1,8 @@
+"""Minimal AIME2025 evaluation run.
+
+Expected: metrics.json and results.jsonl are written to the output directory.
+"""
+
 import logging
 
 from rlfusion.datasets.aime import AIME2025
@@ -21,6 +26,7 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
+    # Expected: evaluation logs include reward_mean and completion_tokens_mean.
     evaluator.evaluate()
 
 

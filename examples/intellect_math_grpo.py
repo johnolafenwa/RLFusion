@@ -1,3 +1,8 @@
+"""GRPO on IntellectMath with a held-out eval split.
+
+Expected: reward_mean and ratio stats in logs.
+"""
+
 import logging
 
 from rlfusion.datasets import IntellectMathDataset
@@ -37,6 +42,7 @@ def main() -> None:
         log_level=logging.INFO,
     )
 
+    # Expected: reward stats logged each step.
     trainer.train()
 
 

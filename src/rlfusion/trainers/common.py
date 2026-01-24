@@ -1,3 +1,5 @@
+"""Shared trainer scaffolding helpers (logging, accelerator, saving)."""
+
 import logging
 from typing import Any, cast
 
