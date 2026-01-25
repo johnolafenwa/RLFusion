@@ -46,6 +46,7 @@ class SFTTrainer:
         logging_steps: int = 10,
         eval_steps: Optional[int] = None,
         eval_dataset: Optional[Sequence[EnvBase]] = None,
+        eval_sample_completions: bool = False,
         max_new_tokens: int = 256,
         do_sample: bool = True,
         sampling_temperature: float = 1.0,
@@ -93,6 +94,7 @@ class SFTTrainer:
             raise ValueError("eval_steps must be >= 1 or None.")
         self.eval_steps = eval_steps
         self.eval_dataset = eval_dataset
+        self.eval_sample_completions = eval_sample_completions
         self.max_new_tokens = max_new_tokens
         self.do_sample = do_sample
         self.sampling_temperature = sampling_temperature
@@ -150,6 +152,7 @@ class SFTTrainer:
                         "saving_steps": saving_steps,
                         "logging_steps": logging_steps,
                         "eval_steps": eval_steps,
+                        "eval_sample_completions": eval_sample_completions,
                         "output_dir": output_dir,
                         "optimizer": optimizer.__name__ if hasattr(optimizer, "__name__") else optimizer.__class__.__name__,
                         "optimizer_args": optimizer_args,
@@ -458,11 +461,12 @@ class SFTTrainer:
                 batch_indices = indices[start : start + self.batch_size]
                 env_batch = [eval_dataset[i] for i in batch_indices]
 
-                _, texts, _, completion_lens = self.sample_completions_batch(env_batch)
-                rewards = [self._compute_reward(env, text) for env, text in zip(env_batch, texts)]
-                valid_rewards = [reward for reward in rewards if reward is not None]
-                all_rewards.extend(valid_rewards)
-                all_completion_lengths.extend(completion_lens)
+                if self.eval_sample_completions:
+                    _, texts, _, completion_lens = self.sample_completions_batch(env_batch)
+                    rewards = [self._compute_reward(env, text) for env, text in zip(env_batch, texts)]
+                    valid_rewards = [reward for reward in rewards if reward is not None]
+                    all_rewards.extend(valid_rewards)
+                    all_completion_lengths.extend(completion_lens)
 
                 prompts = []
                 responses = []
@@ -497,9 +501,11 @@ class SFTTrainer:
                 rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32)
                 reward_mean = float(rewards_tensor.mean().item())
                 reward_std = float(rewards_tensor.std(unbiased=False).item())
-            completion_tokens_mean = float(
-                torch.tensor(all_completion_lengths, dtype=torch.float32).mean().item()
-            )
+            completion_tokens_mean = None
+            if all_completion_lengths:
+                completion_tokens_mean = float(
+                    torch.tensor(all_completion_lengths, dtype=torch.float32).mean().item()
+                )
             ce_loss = None
             perplexity = None
             if total_tokens > 0:
@@ -510,11 +516,12 @@ class SFTTrainer:
                     perplexity = float("inf")
 
             logger.info(
-                "eval completion_tokens_mean=%.1f ce_loss=%s perplexity=%s",
-                completion_tokens_mean,
+                "eval ce_loss=%s perplexity=%s",
                 "n/a" if ce_loss is None else f"{ce_loss:.6f}",
                 "n/a" if perplexity is None else f"{perplexity:.3f}",
             )
+            if completion_tokens_mean is not None:
+                logger.info("eval completion_tokens_mean=%.1f", completion_tokens_mean)
             if reward_mean is not None and reward_std is not None:
                 logger.info(
                     "eval reward_mean=%.4f reward_std=%.4f",
@@ -524,8 +531,9 @@ class SFTTrainer:
 
             if self._wandb is not None:
                 log_data = {
-                    "eval/completion_tokens_mean": completion_tokens_mean,
                 }
+                if completion_tokens_mean is not None:
+                    log_data["eval/completion_tokens_mean"] = completion_tokens_mean
                 if ce_loss is not None:
                     log_data["eval/ce_loss"] = ce_loss
                 if perplexity is not None:
@@ -539,8 +547,9 @@ class SFTTrainer:
                     self._wandb.log(log_data)
 
             results = {
-                "completion_tokens_mean": completion_tokens_mean,
             }
+            if completion_tokens_mean is not None:
+                results["completion_tokens_mean"] = completion_tokens_mean
             if ce_loss is not None:
                 results["ce_loss"] = ce_loss
             if perplexity is not None:
