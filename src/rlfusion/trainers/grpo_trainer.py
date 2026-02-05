@@ -3,9 +3,8 @@
 import importlib
 import logging
 import random
-from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional, List, Tuple, Any, cast
+from typing import Optional, List, Tuple, Any, cast, Protocol, TypeVar
 
 import torch
 import torch.nn.functional as F
@@ -44,15 +43,61 @@ if _USING_LIGER:
 else:
     logger.info("Liger kernel not installed, defaulting to HF")
 
+_SampleT = TypeVar("_SampleT", covariant=True)
+
+
+class DatasetLike(Protocol[_SampleT]):
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int) -> _SampleT: ...
+
+
 class GRPOTrainer():
+    @staticmethod
+    def _validate_init_args(
+        *,
+        num_steps: int,
+        saving_steps: int,
+        logging_steps: int,
+        eval_steps: Optional[int],
+        sampling_temperature: float,
+        max_new_tokens: int,
+        batch_size: int,
+        group_size: int,
+        ppo_steps: int,
+        clip_eps: float,
+        max_grad_norm: Optional[float],
+    ) -> None:
+        if num_steps <= 0:
+            raise ValueError("num_steps must be >= 1.")
+        if saving_steps <= 0:
+            raise ValueError("saving_steps must be >= 1.")
+        if logging_steps <= 0:
+            raise ValueError("logging_steps must be >= 1.")
+        if eval_steps is not None and eval_steps <= 0:
+            raise ValueError("eval_steps must be >= 1 or None.")
+        if sampling_temperature <= 0.0:
+            raise ValueError("sampling_temperature must be > 0.")
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be >= 1.")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be >= 1.")
+        if group_size <= 0:
+            raise ValueError("group_size must be >= 1.")
+        if ppo_steps <= 0:
+            raise ValueError("ppo_steps must be >= 1.")
+        if clip_eps < 0.0:
+            raise ValueError("clip_eps must be >= 0.")
+        if max_grad_norm is not None and max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be > 0 or None.")
+
     def __init__(self,
                  model: str,
-                 train_dataset: Optional[Sequence[Any]],
+                 train_dataset: Optional[DatasetLike[Any]],
                  num_steps: int = 100,
                  saving_steps: int = 10,
                  logging_steps: int = 10,
                  eval_steps: Optional[int] = None,
-                 eval_dataset: Optional[Sequence[EnvBase]] = None,
+                 eval_dataset: Optional[DatasetLike[EnvBase]] = None,
                  enable_wandb: bool = False,
                  wandb_project: str = "grpo",
                  wandb_run_name: Optional[str] = None,
@@ -78,6 +123,19 @@ class GRPOTrainer():
                  log_level: int = logging.INFO,
                  use_accelerate: bool = False,
                  ):
+        self._validate_init_args(
+            num_steps=num_steps,
+            saving_steps=saving_steps,
+            logging_steps=logging_steps,
+            eval_steps=eval_steps,
+            sampling_temperature=sampling_temperature,
+            max_new_tokens=max_new_tokens,
+            batch_size=batch_size,
+            group_size=group_size,
+            ppo_steps=ppo_steps,
+            clip_eps=clip_eps,
+            max_grad_norm=max_grad_norm,
+        )
 
         self.accelerator = None
         if use_accelerate:
@@ -108,8 +166,6 @@ class GRPOTrainer():
         self.invalid_penalty = invalid_penalty
         self.max_grad_norm = max_grad_norm
 
-        if eval_steps is not None and eval_steps <= 0:
-            raise ValueError("eval_steps must be >= 1 or None.")
         self.eval_steps = eval_steps
         self.eval_dataset = eval_dataset
 
@@ -135,11 +191,11 @@ class GRPOTrainer():
             "attn_implementation": attn_implementation,
         }
         if device == "cuda" and torch.cuda.is_available():
-            model_kwargs["dtype"] = (
+            model_kwargs["torch_dtype"] = (
                 torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             )
         elif device == "mps":
-            model_kwargs["dtype"] = torch.float16
+            model_kwargs["torch_dtype"] = torch.float16
 
         self.model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
 
@@ -191,7 +247,7 @@ class GRPOTrainer():
                         "optimizer_args": optimizer_args,
                         "lr_scheduler": None if lr_scheduler is None else (lr_scheduler.__name__ if hasattr(lr_scheduler, "__name__") else lr_scheduler.__class__.__name__),
                         "lr_scheduler_args": lr_scheduler_args,
-                        "attn_implementation": "flash_attention_2",
+                        "attn_implementation": attn_implementation,
                         "dtype": str(self.model.dtype),
                         "seed": seed,
                         "max_new_tokens": self.max_new_tokens,
@@ -272,25 +328,42 @@ class GRPOTrainer():
     def _compute_reward(self, env: EnvBase, completion_text: Optional[str]) -> float:
         if completion_text is None:
             return -(self.max_error + self.invalid_penalty)
+        reward_value = env.get_reward(completion_text)
+        if reward_value is None:
+            return -(self.max_error + self.invalid_penalty)
+        return float(reward_value)
 
-        if env.answer is None:
-            raise ValueError("Environment has no defined answer.")
-        else:
-            return float(env.get_reward(completion_text))
 
-
-    def compute_advantage(self, trajectories: List[Trajectory], eps: float = 1e-8) -> None:
+    def compute_advantage(
+        self,
+        trajectories: List[Trajectory],
+        eps: float = 1e-8,
+        group_size: Optional[int] = None,
+    ) -> None:
         for traj in trajectories:
             if traj.reward is None:
                 raise ValueError("Trajectory reward is required to compute advantage.")
-        rewards = torch.tensor([traj.reward for traj in trajectories], dtype=torch.float32)
-        mean_reward = float(rewards.mean().item())
-        std = float(rewards.std(unbiased=False).item())
+        if not trajectories:
+            return
 
-        for traj in trajectories:
-            assert traj.reward is not None
-            # Normalize rewards to keep PPO updates numerically stable.
-            traj.advantage = (traj.reward - mean_reward) / (std + eps)
+        group = len(trajectories) if group_size is None else int(group_size)
+        if group <= 0:
+            raise ValueError("group_size must be >= 1.")
+        if len(trajectories) % group != 0:
+            raise ValueError("Number of trajectories must be divisible by group_size.")
+
+        # GRPO advantages are normalized within each prompt group.
+        for start in range(0, len(trajectories), group):
+            group_trajectories = trajectories[start : start + group]
+            rewards = torch.tensor(
+                [traj.reward for traj in group_trajectories],
+                dtype=torch.float32,
+            )
+            mean_reward = float(rewards.mean().item())
+            std = float(rewards.std(unbiased=False).item())
+            for traj in group_trajectories:
+                assert traj.reward is not None
+                traj.advantage = (traj.reward - mean_reward) / (std + eps)
 
     def _build_full_attention_mask(
         self,
@@ -519,7 +592,7 @@ class GRPOTrainer():
                 trajectory.reward = self._compute_reward(env_instance, texts[i])
                 trajectories.append(trajectory)
 
-            self.compute_advantage(trajectories)
+            self.compute_advantage(trajectories, group_size=self.group_size)
 
             input_length = int(input_attention_mask.shape[1])
             # Build a full mask that keeps prompt padding holes but enables generated tokens.
@@ -566,7 +639,10 @@ class GRPOTrainer():
                     kl_beta=self.kl_penalty,
                 )
                 loss = loss_per.mean()
-                loss.backward()
+                if self.accelerator is None:
+                    loss.backward()
+                else:
+                    self.accelerator.backward(loss)
                 if self.max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
@@ -599,7 +675,7 @@ class GRPOTrainer():
                 self.lr_scheduler.step()
 
             log_env = env_batch[0] if env_batch else envs[0]
-            self._log_step(step, log_env, trajectories, batch_stats)
+            self._log_step(step + 1, log_env, trajectories, batch_stats)
 
             if self.eval_steps is not None and (step + 1) % self.eval_steps == 0:
                 if self._is_main_process():
@@ -633,7 +709,7 @@ class GRPOTrainer():
 
     def test(
         self,
-        dataset: Optional[Sequence[Any]] = None,
+        dataset: Optional[DatasetLike[EnvBase]] = None,
         num_batches: Optional[int] = None,
         step: Optional[int] = None,
         eval_temperature: Optional[float] = None,

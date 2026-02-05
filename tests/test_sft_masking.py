@@ -23,8 +23,12 @@ class DummyTokenizer:
         return " ".join(str(t) for t in tokens)
 
     def pad(self, encoded, padding=True, return_tensors="pt", max_length=None):
-        input_ids = encoded["input_ids"]
-        attention_mask = encoded["attention_mask"]
+        if isinstance(encoded, list):
+            input_ids = [sample["input_ids"] for sample in encoded]
+            attention_mask = [sample["attention_mask"] for sample in encoded]
+        else:
+            input_ids = encoded["input_ids"]
+            attention_mask = encoded["attention_mask"]
         if max_length is None:
             max_length = max(len(ids) for ids in input_ids)
         padded_ids = []
