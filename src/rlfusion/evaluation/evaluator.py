@@ -111,9 +111,9 @@ class Evaluator:
             }
             if device == "cuda":
                 dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-                model_kwargs["dtype"] = dtype
+                model_kwargs["torch_dtype"] = dtype
             elif device == "mps":
-                model_kwargs["dtype"] = torch.float16
+                model_kwargs["torch_dtype"] = torch.float16
             self._hf_model_kwargs = model_kwargs
             self.model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
         else:

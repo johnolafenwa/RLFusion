@@ -122,11 +122,11 @@ class OnPolicyDistillationTrainer:
             "attn_implementation": attn_implementation,
         }
         if device == "cuda" and torch.cuda.is_available():
-            model_kwargs["dtype"] = (
+            model_kwargs["torch_dtype"] = (
                 torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             )
         elif device == "mps":
-            model_kwargs["dtype"] = torch.float16
+            model_kwargs["torch_dtype"] = torch.float16
 
         self.model = AutoModelForCausalLM.from_pretrained(model, **model_kwargs)
         self.model.config.use_cache = False

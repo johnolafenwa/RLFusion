@@ -146,11 +146,11 @@ class SFTTrainer:
             "attn_implementation": attn_implementation,
         }
         if device == "cuda":
-            model_kwargs["dtype"] = (
+            model_kwargs["torch_dtype"] = (
                 torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             )
         elif device == "mps":
-            model_kwargs["dtype"] = torch.float16
+            model_kwargs["torch_dtype"] = torch.float16
         self.model = AutoModelForCausalLM.from_pretrained(
             model,
             **model_kwargs,
@@ -394,7 +394,10 @@ class SFTTrainer:
             return empty, empty, empty
 
         padded = self.tokenizer.pad(
-            {"input_ids": batch_input_ids, "attention_mask": batch_attention_mask},
+            [
+                {"input_ids": sample_ids, "attention_mask": sample_mask}
+                for sample_ids, sample_mask in zip(batch_input_ids, batch_attention_mask)
+            ],
             padding=True,
             return_tensors="pt",
             max_length=self.max_seq_len,

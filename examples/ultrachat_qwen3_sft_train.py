@@ -15,7 +15,7 @@ def main():
         eval_steps=100,
         saving_steps=100,
         logging_steps=10,
-        max_seq_len=2048,
+        max_seq_len=4096,
         optimizer_args={"lr": 1e-5},
         output_dir="./ultrachat_sft_qwen3_4b",
     )
