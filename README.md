@@ -79,7 +79,10 @@ env = EnvBase(
 
 ## Trainers
 ### SFT
-`SFTTrainer` consumes `(prompt, answer)` and masks non-assistant tokens while training assistant tokens. To evaluate during training, set `eval_steps` and pass an `eval_dataset` of environments with `get_reward`.
+`SFTTrainer` consumes `(prompt, answer)` and masks non-assistant tokens while training assistant tokens.
+Eval supports two modes:
+- Default (`eval_sample_completions=False`): logs token-level `ce_loss` and `perplexity` from labeled assistant tokens.
+- Reward sampling (`eval_sample_completions=True`): generates completions and logs reward metrics. This mode requires `eval_dataset` environments with `get_reward`.
 
 ```python
 from torch.utils.data import Dataset

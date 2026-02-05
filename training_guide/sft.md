@@ -13,8 +13,11 @@ Recommended starting point:
 Notes:
 - If loss diverges, lower the learning rate or reduce max sequence length.
 - If you want to train on prompts too, set `mask_prompt=False`.
-- For eval during training, `eval_dataset` items must implement `get_reward`.
-- Eval metrics are reward-based even though training optimizes token-level loss.
+- Eval has two modes:
+  - Default (`eval_sample_completions=False`): computes token-level `ce_loss` and `perplexity` on assistant labels.
+  - Reward sampling (`eval_sample_completions=True`): generates completions and logs reward metrics.
+- For reward sampling mode, `eval_dataset` items must implement `get_reward`.
+- Role-span extraction for masking is O(turns^2) in message count, which can be slow for very long chats.
 
 ## Distributed Training (Accelerate)
 To run SFT on multiple GPUs:

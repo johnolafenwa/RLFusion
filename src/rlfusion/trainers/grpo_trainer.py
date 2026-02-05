@@ -387,7 +387,10 @@ class GRPOTrainer():
         mask = torch.zeros((sequence_length - 1,), device=trajectory.sequence_ids.device, dtype=torch.float32)
 
         # Use padded input length when provided so the mask starts at the generation boundary.
-        prompt_len = trajectory.prompt_len if input_length is None else int(input_length)
+        prompt_len_value = trajectory.prompt_len if input_length is None else input_length
+        if prompt_len_value is None:
+            raise ValueError("Prompt length must be defined to build the mask.")
+        prompt_len = int(prompt_len_value)
         completion_len = trajectory.completion_len
         if completion_len is None:
             completion_len = max(sequence_length - prompt_len, 0)

@@ -1,17 +1,16 @@
 from dataclasses import dataclass
-from typing import Optional
 
 from torch.utils.data import Dataset
 
 from rlfusion.envs import EnvBase
-from rlfusion.utils import get_boxed_answer
 
 
 @dataclass
 class CapyBaraEnv(EnvBase):
 
     def get_reward(self, prediction: str) -> float:
-        return None
+        # Capybara is used as an SFT-only corpus and does not define task rewards.
+        return 0.0
 
 
 class CapyBaraSFTDataset(Dataset):

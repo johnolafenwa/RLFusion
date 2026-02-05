@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from rlfusion.trainers.sft_trainer import SFTTrainer
@@ -139,3 +140,119 @@ def test_sft_trains_only_last_assistant_turn_when_enabled():
             assert labels[0, idx].item() == input_ids[0, idx].item()
         else:
             assert labels[0, idx].item() == -100
+
+
+def test_sft_drops_overlength_samples_with_warning(caplog):
+    trainer = _make_trainer(mask_prompt=True)
+    trainer.max_seq_len = 10
+
+    short_prompt = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "U"},
+    ]
+    long_prompt = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "U" * 64},
+    ]
+
+    with caplog.at_level("WARNING"):
+        input_ids, attention_mask, labels = trainer._build_batch(
+            [short_prompt, long_prompt],
+            ["A", "A"],
+        )
+
+    assert input_ids.shape[0] == 1
+    assert attention_mask.shape[0] == 1
+    assert labels.shape[0] == 1
+    assert "Consider increasing max_seq_len" in caplog.text
+
+
+def test_sft_returns_empty_batch_when_all_samples_dropped(caplog):
+    trainer = _make_trainer(mask_prompt=True)
+    trainer.max_seq_len = 4
+
+    long_prompt = [
+        {"role": "system", "content": "S"},
+        {"role": "user", "content": "U" * 64},
+    ]
+
+    with caplog.at_level("WARNING"):
+        input_ids, attention_mask, labels = trainer._build_batch([long_prompt], ["A"])
+
+    assert tuple(input_ids.shape) == (0, 0)
+    assert tuple(attention_mask.shape) == (0, 0)
+    assert tuple(labels.shape) == (0, 0)
+    assert "Dropped 1/1 sample(s)" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("num_steps", 0, "num_steps must be >= 1."),
+        ("batch_size", 0, "batch_size must be >= 1."),
+        ("saving_steps", 0, "saving_steps must be >= 1."),
+        ("logging_steps", 0, "logging_steps must be >= 1."),
+    ],
+)
+def test_sft_validate_init_args_rejects_non_positive(field, value, message):
+    with pytest.raises(ValueError, match=message):
+        if field == "num_steps":
+            SFTTrainer._validate_init_args(
+                num_steps=value,
+                batch_size=1,
+                saving_steps=1,
+                logging_steps=1,
+                eval_steps=None,
+                max_seq_len=None,
+            )
+        elif field == "batch_size":
+            SFTTrainer._validate_init_args(
+                num_steps=1,
+                batch_size=value,
+                saving_steps=1,
+                logging_steps=1,
+                eval_steps=None,
+                max_seq_len=None,
+            )
+        elif field == "saving_steps":
+            SFTTrainer._validate_init_args(
+                num_steps=1,
+                batch_size=1,
+                saving_steps=value,
+                logging_steps=1,
+                eval_steps=None,
+                max_seq_len=None,
+            )
+        else:
+            SFTTrainer._validate_init_args(
+                num_steps=1,
+                batch_size=1,
+                saving_steps=1,
+                logging_steps=value,
+                eval_steps=None,
+                max_seq_len=None,
+            )
+
+
+def test_sft_validate_init_args_rejects_invalid_eval_steps():
+    with pytest.raises(ValueError, match="eval_steps must be >= 1 or None."):
+        SFTTrainer._validate_init_args(
+            num_steps=1,
+            batch_size=1,
+            saving_steps=1,
+            logging_steps=1,
+            eval_steps=0,
+            max_seq_len=None,
+        )
+
+
+def test_sft_validate_init_args_rejects_invalid_max_seq_len():
+    with pytest.raises(ValueError, match="max_seq_len must be >= 1 or None."):
+        SFTTrainer._validate_init_args(
+            num_steps=1,
+            batch_size=1,
+            saving_steps=1,
+            logging_steps=1,
+            eval_steps=None,
+            max_seq_len=0,
+        )

@@ -36,6 +36,29 @@ else:
 
 
 class SFTTrainer:
+    @staticmethod
+    def _validate_init_args(
+        *,
+        num_steps: int,
+        batch_size: int,
+        saving_steps: int,
+        logging_steps: int,
+        eval_steps: Optional[int],
+        max_seq_len: Optional[int],
+    ) -> None:
+        if num_steps <= 0:
+            raise ValueError("num_steps must be >= 1.")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be >= 1.")
+        if saving_steps <= 0:
+            raise ValueError("saving_steps must be >= 1.")
+        if logging_steps <= 0:
+            raise ValueError("logging_steps must be >= 1.")
+        if eval_steps is not None and eval_steps <= 0:
+            raise ValueError("eval_steps must be >= 1 or None.")
+        if max_seq_len is not None and max_seq_len <= 0:
+            raise ValueError("max_seq_len must be >= 1 or None.")
+
     def __init__(
         self,
         model: str,
@@ -67,6 +90,15 @@ class SFTTrainer:
         log_level: int = logging.INFO,
         use_accelerate: bool = False,
     ):
+        self._validate_init_args(
+            num_steps=num_steps,
+            batch_size=batch_size,
+            saving_steps=saving_steps,
+            logging_steps=logging_steps,
+            eval_steps=eval_steps,
+            max_seq_len=max_seq_len,
+        )
+
         self.accelerator = None
         if use_accelerate:
             from accelerate import Accelerator
@@ -90,8 +122,6 @@ class SFTTrainer:
         self.assistant_loss_mode: Literal["all", "last"] = assistant_loss_mode
         self.max_grad_norm = max_grad_norm
 
-        if eval_steps is not None and eval_steps <= 0:
-            raise ValueError("eval_steps must be >= 1 or None.")
         self.eval_steps = eval_steps
         self.eval_dataset = eval_dataset
         self.eval_sample_completions = eval_sample_completions
@@ -131,6 +161,7 @@ class SFTTrainer:
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"
+        self._ensure_chat_template()
 
         self._wandb = None
         should_enable_wandb = enable_wandb and (
@@ -195,6 +226,24 @@ class SFTTrainer:
 
     def _configure_logging(self, log_level: int) -> None:
         configure_logging(logger, log_level)
+
+    def _ensure_chat_template(self) -> None:
+        if getattr(self.tokenizer, "chat_template", None) is not None:
+            return
+        default_template = getattr(self.tokenizer, "default_chat_template", None)
+        if default_template:
+            self.tokenizer.chat_template = default_template
+            return
+        try:
+            from transformers.utils import chat_template_utils
+        except Exception:
+            logger.warning("Tokenizer has no chat_template; apply_chat_template may fail.")
+            return
+        default_template = getattr(chat_template_utils, "DEFAULT_CHAT_TEMPLATE", None)
+        if default_template:
+            self.tokenizer.chat_template = default_template
+        else:
+            logger.warning("Tokenizer has no chat_template; apply_chat_template may fail.")
 
     def _is_main_process(self) -> bool:
         return is_main_process(self.accelerator)
@@ -270,7 +319,8 @@ class SFTTrainer:
         """Return token ids and per-message token spans (start, end, role).
 
         Spans are computed by tokenizing prefixes of `messages` using `apply_chat_template` and
-        taking deltas. This lets us mask tokens by role for multi-turn chats.
+        taking deltas. This is O(turns^2) in message count and can be a bottleneck for very
+        long chats. It lets us mask tokens by role for multi-turn chats.
         """
         spans: list[tuple[int, int, str]] = []
         prev_len = 0
@@ -294,9 +344,12 @@ class SFTTrainer:
         batch_input_ids: list[list[int]] = []
         batch_attention_mask: list[list[int]] = []
         batch_labels: list[list[int]] = []
+        total_samples = 0
+        dropped_too_long = 0
 
         use_mask_prompt = self.mask_prompt if mask_prompt is None else mask_prompt
         for prompt, response in zip(prompts, responses):
+            total_samples += 1
             prompt = self._normalize_prompt(prompt)
 
             messages = list(prompt)
@@ -316,14 +369,29 @@ class SFTTrainer:
                     labels[start:end] = input_ids[start:end]
 
             if self.max_seq_len is not None and len(input_ids) > self.max_seq_len:
-                input_ids = input_ids[: self.max_seq_len]
-                labels = labels[: self.max_seq_len]
+                dropped_too_long += 1
+                continue
 
             attention_mask = [1] * len(input_ids)
 
             batch_input_ids.append(input_ids)
             batch_attention_mask.append(attention_mask)
             batch_labels.append(labels)
+
+        if dropped_too_long > 0:
+            logger.warning(
+                (
+                    "Dropped %d/%d sample(s) because tokenized length exceeded "
+                    "max_seq_len=%d. Consider increasing max_seq_len."
+                ),
+                dropped_too_long,
+                total_samples,
+                self.max_seq_len,
+            )
+
+        if not batch_input_ids:
+            empty = torch.empty((0, 0), dtype=torch.long)
+            return empty, empty, empty
 
         padded = self.tokenizer.pad(
             {"input_ids": batch_input_ids, "attention_mask": batch_attention_mask},
@@ -353,17 +421,36 @@ class SFTTrainer:
         self.model.train()
 
         for step in range(self.num_steps):
-            indices = [random.randint(0, dataset_len - 1) for _ in range(self.batch_size)]
-            batch_samples = [self.train_dataset[i] for i in indices]
+            max_resample_attempts = 8
+            input_ids = torch.empty((0, 0), dtype=torch.long)
+            attention_mask = torch.empty((0, 0), dtype=torch.long)
+            labels = torch.empty((0, 0), dtype=torch.long)
+            for _attempt in range(max_resample_attempts):
+                indices = [random.randint(0, dataset_len - 1) for _ in range(self.batch_size)]
+                batch_samples = [self.train_dataset[i] for i in indices]
 
-            prompts = []
-            responses = []
-            for sample in batch_samples:
-                prompt, response = self._extract_sample(sample)
-                prompts.append(prompt)
-                responses.append(None if response is None else str(response))
+                prompts = []
+                responses = []
+                for sample in batch_samples:
+                    prompt, response = self._extract_sample(sample)
+                    prompts.append(prompt)
+                    responses.append(None if response is None else str(response))
 
-            input_ids, attention_mask, labels = self._build_batch(prompts, responses)
+                input_ids, attention_mask, labels = self._build_batch(prompts, responses)
+                if input_ids.size(0) > 0:
+                    break
+
+            if input_ids.size(0) == 0:
+                logger.warning(
+                    (
+                        "Skipping step %d because all sampled examples were dropped "
+                        "for exceeding max_seq_len after %d attempts. Consider "
+                        "increasing max_seq_len."
+                    ),
+                    step + 1,
+                    max_resample_attempts,
+                )
+                continue
 
             model_device = next(self.model.parameters()).device
             input_ids = input_ids.to(model_device)
@@ -481,15 +568,18 @@ class SFTTrainer:
                     input_ids, attention_mask, labels = self._build_batch(
                         prompts, responses, mask_prompt=True
                     )
+                    if input_ids.size(0) == 0:
+                        continue
                     model_device = next(self.model.parameters()).device
                     input_ids = input_ids.to(model_device)
                     attention_mask = attention_mask.to(model_device)
                     labels = labels.to(model_device)
-                    outputs = self.model(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        labels=labels,
-                    )
+                    with torch.no_grad():
+                        outputs = self.model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            labels=labels,
+                        )
                     token_count = int((labels != -100).sum().item())
                     if token_count > 0:
                         total_loss += float(outputs.loss.item()) * token_count

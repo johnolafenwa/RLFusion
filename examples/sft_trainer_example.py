@@ -1,6 +1,9 @@
 """Minimal SFT run.
 
-Expected: logs print `loss=...` every step and eval logs `reward_mean`.
+Expected:
+- training logs print `loss=...` every step
+- eval logs `ce_loss` and `perplexity` by default
+- set `eval_sample_completions=True` to also log reward metrics (`reward_mean`, `reward_std`)
 """
 
 import logging

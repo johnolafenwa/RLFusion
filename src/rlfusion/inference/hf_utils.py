@@ -2,12 +2,43 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Literal, overload, cast
 
 import torch
 
 from rlfusion.envs import EnvBase
 from rlfusion.trainers.types import AttentionMask, GenerateOutput, TokenIds
+
+CompletionBatch = tuple[TokenIds, list[str], list[int], list[int]]
+CompletionBatchWithMask = tuple[TokenIds, list[str], list[int], list[int], AttentionMask]
+
+
+@overload
+def sample_completions_batch_hf(
+    *,
+    model: Any,
+    tokenizer: Any,
+    envs: list[EnvBase],
+    do_sample: bool,
+    sampling_temperature: float,
+    max_new_tokens: int,
+    generation_args: dict[str, Any],
+    return_attention_mask: Literal[False] = False,
+) -> CompletionBatch: ...
+
+
+@overload
+def sample_completions_batch_hf(
+    *,
+    model: Any,
+    tokenizer: Any,
+    envs: list[EnvBase],
+    do_sample: bool,
+    sampling_temperature: float,
+    max_new_tokens: int,
+    generation_args: dict[str, Any],
+    return_attention_mask: Literal[True],
+) -> CompletionBatchWithMask: ...
 
 
 def sample_completions_batch_hf(
@@ -20,9 +51,7 @@ def sample_completions_batch_hf(
     max_new_tokens: int,
     generation_args: dict[str, Any],
     return_attention_mask: bool = False,
-) -> tuple[TokenIds, list[str], list[int], list[int]] | tuple[
-    TokenIds, list[str], list[int], list[int], AttentionMask
-]:
+) -> CompletionBatch | CompletionBatchWithMask:
     formatted_prompts = [
         tokenizer.apply_chat_template(
             env.prompt,
