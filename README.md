@@ -121,6 +121,15 @@ trainer = SFTTrainer(
 trainer.train()
 ```
 
+For a real SFT corpus, you can use UltraChat:
+
+```python
+from rlfusion.datasets import UltraChatSFTDataset
+
+train_dataset = UltraChatSFTDataset(train=True, max_samples=10_000, seed=42)
+eval_dataset = UltraChatSFTDataset(train=False, max_samples=1_000, seed=42)
+```
+
 ### RLVR (GRPO)
 `GRPOTrainer` samples completions from the model, computes rewards via the environment, and optimizes a GRPO objective. To evaluate during training, set `eval_steps` and pass an `eval_dataset` of environments with `get_reward`.
 
