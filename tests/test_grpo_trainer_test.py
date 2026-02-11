@@ -48,6 +48,22 @@ def test_grpo_test_reports_reward_and_tokens():
     assert results["completion_tokens_mean"] == 1.0
 
 
+def test_grpo_test_rejects_non_positive_num_batches():
+    trainer = GRPOTrainer.__new__(GRPOTrainer)
+    trainer.batch_size = 1
+    trainer.log_completions = False
+    trainer.max_log_chars = 200
+    trainer.model = DummyModel()
+    trainer.max_error = 1.0
+    trainer.invalid_penalty = 1.0
+    trainer.sampling_temperature = 1.0
+    trainer._wandb = None
+
+    dataset = [DummyEnv(prompt=[{"role": "user", "content": "q"}], answer="4")]
+    with pytest.raises(ValueError, match="num_batches must be >= 1 or None."):
+        trainer.test(dataset=dataset, num_batches=0)
+
+
 def test_grpo_advantage_normalizes_within_group():
     trainer = GRPOTrainer.__new__(GRPOTrainer)
     env = DummyEnv(prompt=[{"role": "user", "content": "q"}], answer="4")
@@ -84,7 +100,7 @@ def test_grpo_compute_reward_does_not_require_answer():
         ("sampling_temperature", 0.0, "sampling_temperature must be > 0."),
         ("max_new_tokens", 0, "max_new_tokens must be >= 1."),
         ("batch_size", 0, "batch_size must be >= 1."),
-        ("group_size", 0, "group_size must be >= 1."),
+        ("group_size", 1, "group_size must be >= 2."),
         ("ppo_steps", 0, "ppo_steps must be >= 1."),
     ],
 )
@@ -99,7 +115,7 @@ def test_grpo_validate_init_args_rejects_invalid_values(field, value, message):
                 sampling_temperature=1.0,
                 max_new_tokens=1,
                 batch_size=1,
-                group_size=1,
+                group_size=2,
                 ppo_steps=1,
                 clip_eps=0.2,
                 max_grad_norm=None,
@@ -113,7 +129,7 @@ def test_grpo_validate_init_args_rejects_invalid_values(field, value, message):
                 sampling_temperature=1.0,
                 max_new_tokens=1,
                 batch_size=1,
-                group_size=1,
+                group_size=2,
                 ppo_steps=1,
                 clip_eps=0.2,
                 max_grad_norm=None,
@@ -127,7 +143,7 @@ def test_grpo_validate_init_args_rejects_invalid_values(field, value, message):
                 sampling_temperature=1.0,
                 max_new_tokens=1,
                 batch_size=1,
-                group_size=1,
+                group_size=2,
                 ppo_steps=1,
                 clip_eps=0.2,
                 max_grad_norm=None,
@@ -141,7 +157,7 @@ def test_grpo_validate_init_args_rejects_invalid_values(field, value, message):
                 sampling_temperature=value,
                 max_new_tokens=1,
                 batch_size=1,
-                group_size=1,
+                group_size=2,
                 ppo_steps=1,
                 clip_eps=0.2,
                 max_grad_norm=None,
@@ -155,7 +171,7 @@ def test_grpo_validate_init_args_rejects_invalid_values(field, value, message):
                 sampling_temperature=1.0,
                 max_new_tokens=value,
                 batch_size=1,
-                group_size=1,
+                group_size=2,
                 ppo_steps=1,
                 clip_eps=0.2,
                 max_grad_norm=None,
@@ -169,7 +185,7 @@ def test_grpo_validate_init_args_rejects_invalid_values(field, value, message):
                 sampling_temperature=1.0,
                 max_new_tokens=1,
                 batch_size=value,
-                group_size=1,
+                group_size=2,
                 ppo_steps=1,
                 clip_eps=0.2,
                 max_grad_norm=None,
@@ -197,7 +213,7 @@ def test_grpo_validate_init_args_rejects_invalid_values(field, value, message):
                 sampling_temperature=1.0,
                 max_new_tokens=1,
                 batch_size=1,
-                group_size=1,
+                group_size=2,
                 ppo_steps=value,
                 clip_eps=0.2,
                 max_grad_norm=None,

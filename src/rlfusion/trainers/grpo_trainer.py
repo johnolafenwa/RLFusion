@@ -81,8 +81,8 @@ class GRPOTrainer():
             raise ValueError("max_new_tokens must be >= 1.")
         if batch_size <= 0:
             raise ValueError("batch_size must be >= 1.")
-        if group_size <= 0:
-            raise ValueError("group_size must be >= 1.")
+        if group_size <= 1:
+            raise ValueError("group_size must be >= 2.")
         if ppo_steps <= 0:
             raise ValueError("ppo_steps must be >= 1.")
         if clip_eps < 0.0:
@@ -716,6 +716,8 @@ class GRPOTrainer():
     ) -> dict:
         if dataset is None:
             raise ValueError("dataset is required for testing.")
+        if num_batches is not None and num_batches <= 0:
+            raise ValueError("num_batches must be >= 1 or None.")
         eval_dataset = dataset
         dataset_len = len(eval_dataset)
         if dataset_len == 0:

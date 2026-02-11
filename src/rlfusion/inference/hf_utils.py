@@ -61,7 +61,13 @@ def sample_completions_batch_hf(
         for env in envs
     ]
 
-    input_tokens = tokenizer(formatted_prompts, return_tensors="pt", padding=True)
+    # Decoder-only generation needs left padding for correct batched prompts.
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        input_tokens = tokenizer(formatted_prompts, return_tensors="pt", padding=True)
+    finally:
+        tokenizer.padding_side = original_padding_side
     model_device = next(model.parameters()).device
     input_ids = input_tokens["input_ids"].to(model_device)
     attention_mask = input_tokens["attention_mask"].to(model_device)
