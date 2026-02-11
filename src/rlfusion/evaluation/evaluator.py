@@ -29,6 +29,7 @@ from rlfusion.trainers.utils import (
     configure_torch_backends,
     format_prompt,
     get_device,
+    get_tokenizer_compat_kwargs,
     resolve_attention_implementation,
     set_seed,
     truncate_text,
@@ -122,7 +123,8 @@ class Evaluator:
             )
             self.model = None
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model)
+        tokenizer_kwargs = get_tokenizer_compat_kwargs(model)
+        self.tokenizer = AutoTokenizer.from_pretrained(model, **tokenizer_kwargs)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"
@@ -155,7 +157,8 @@ class Evaluator:
         """Update the evaluator to point at a new model checkpoint (path or HF id)."""
         self._model_id_or_path = model
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model)
+        tokenizer_kwargs = get_tokenizer_compat_kwargs(model)
+        self.tokenizer = AutoTokenizer.from_pretrained(model, **tokenizer_kwargs)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"

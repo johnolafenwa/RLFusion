@@ -4,7 +4,7 @@ import importlib
 import math
 import logging
 import random
-from collections.abc import Sequence
+from collections.abc import Sequence, Mapping
 from pathlib import Path
 from typing import Optional, Iterable, Tuple, Any, Literal, cast
 
@@ -26,7 +26,13 @@ from transformers import AutoTokenizer
 from rlfusion.envs import EnvBase
 from rlfusion.inference.hf_utils import sample_completions_batch_hf
 from rlfusion.trainers.common import configure_logging, is_main_process, unwrap_model_for_saving
-from rlfusion.trainers.utils import get_device, set_seed, configure_torch_backends, resolve_attention_implementation
+from rlfusion.trainers.utils import (
+    get_device,
+    set_seed,
+    configure_torch_backends,
+    resolve_attention_implementation,
+    get_tokenizer_compat_kwargs,
+)
 
 logger = logging.getLogger(__name__)
 if _USING_LIGER:
@@ -132,7 +138,11 @@ class SFTTrainer:
 
         device = get_device()
         if device == "cuda":
-            device_map = "auto"
+            if self.accelerator is None:
+                device_map: str | dict[str, int] = "auto"
+            else:
+                # In distributed mode each rank owns one device.
+                device_map = {"": int(self.accelerator.local_process_index)}
             configure_torch_backends()
         else:
             device_map = device
@@ -140,7 +150,8 @@ class SFTTrainer:
         self.device = device
         self.device_map = device_map
 
-        attn_implementation = resolve_attention_implementation(device_map)
+        attn_device_map = "auto" if device_map == "auto" else "manual"
+        attn_implementation = resolve_attention_implementation(attn_device_map)
         model_kwargs: dict[str, Any] = {
             "device_map": device_map,
             "attn_implementation": attn_implementation,
@@ -157,7 +168,8 @@ class SFTTrainer:
         )
         self.model.config.use_cache = False
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model)
+        tokenizer_kwargs = get_tokenizer_compat_kwargs(model)
+        self.tokenizer = AutoTokenizer.from_pretrained(model, **tokenizer_kwargs)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"
@@ -309,8 +321,14 @@ class SFTTrainer:
             add_generation_prompt=False,
             tokenize=True,
         )
+        if isinstance(token_ids, Mapping):
+            # transformers>=5 may return a BatchEncoding dict with input_ids/attention_mask.
+            token_ids = token_ids.get("input_ids", [])
         if isinstance(token_ids, torch.Tensor):
             return token_ids.tolist()
+        if token_ids and isinstance(token_ids[0], list):
+            # Defensive handling for unexpected batched outputs.
+            return token_ids[0]
         return token_ids
 
     def _chat_template_message_spans(

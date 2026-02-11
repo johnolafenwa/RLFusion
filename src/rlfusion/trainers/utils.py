@@ -1,8 +1,10 @@
 """Trainer utilities: device selection, seeding, formatting, mask helpers."""
 
 import importlib.util
+import json
 import random
-from typing import Optional, Sequence
+from pathlib import Path
+from typing import Optional, Sequence, Any
 
 import numpy as np
 import torch
@@ -39,7 +41,7 @@ def configure_torch_backends():
         torch.backends.cudnn.deterministic = False
 
 
-def resolve_attention_implementation(device_map: str) -> str:
+def resolve_attention_implementation(device_map: object) -> str:
     if device_map != "auto":
         return "sdpa"
     if not torch.cuda.is_available():
@@ -47,6 +49,36 @@ def resolve_attention_implementation(device_map: str) -> str:
     if importlib.util.find_spec("flash_attn") is None:
         return "sdpa"
     return "flash_attention_2"
+
+
+def get_tokenizer_compat_kwargs(model_id_or_path: str) -> dict[str, Any]:
+    """Return tokenizer kwargs that smooth over local checkpoint format drift.
+
+    Newer transformers versions expect `extra_special_tokens` as a dict. Some
+    saved checkpoints store it as a plain list, which raises at tokenizer load.
+    """
+    model_path = Path(model_id_or_path)
+    if not model_path.is_dir():
+        return {}
+
+    tokenizer_config_path = model_path / "tokenizer_config.json"
+    if not tokenizer_config_path.exists():
+        return {}
+
+    try:
+        tokenizer_config = json.loads(tokenizer_config_path.read_text())
+    except Exception:
+        return {}
+
+    extra_special_tokens = tokenizer_config.get("extra_special_tokens")
+    if not isinstance(extra_special_tokens, list):
+        return {}
+
+    normalized_tokens: dict[str, str] = {}
+    for idx, token in enumerate(extra_special_tokens):
+        token_value = token if isinstance(token, str) else str(token)
+        normalized_tokens[f"extra_special_token_{idx}"] = token_value
+    return {"extra_special_tokens": normalized_tokens}
 
 
 def truncate_text(text: Optional[str], max_chars: Optional[int]) -> str:

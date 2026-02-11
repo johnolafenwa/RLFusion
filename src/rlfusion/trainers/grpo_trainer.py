@@ -32,6 +32,7 @@ from rlfusion.trainers.utils import (
     truncate_text,
     format_prompt,
     resolve_attention_implementation,
+    get_tokenizer_compat_kwargs,
     build_full_attention_mask,
 )
 from rlfusion.trainers.common import configure_logging, is_main_process, unwrap_model_for_saving
@@ -172,7 +173,11 @@ class GRPOTrainer():
         device = get_device()
 
         if device == "cuda":
-            device_map = "auto"
+            if self.accelerator is None:
+                device_map: str | dict[str, int] = "auto"
+            else:
+                # In distributed mode each rank owns one device.
+                device_map = {"": int(self.accelerator.local_process_index)}
 
             # Configure torch backends for performance
             configure_torch_backends()
@@ -185,7 +190,8 @@ class GRPOTrainer():
         self.device_map = device_map
         self.train_dataset = train_dataset
 
-        attn_implementation = resolve_attention_implementation(device_map)
+        attn_device_map = "auto" if device_map == "auto" else "manual"
+        attn_implementation = resolve_attention_implementation(attn_device_map)
         model_kwargs: dict[str, Any] = {
             "device_map": device_map,
             "attn_implementation": attn_implementation,
@@ -201,7 +207,8 @@ class GRPOTrainer():
 
         self.model.config.use_cache = False 
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model)
+        tokenizer_kwargs = get_tokenizer_compat_kwargs(model)
+        self.tokenizer = AutoTokenizer.from_pretrained(model, **tokenizer_kwargs)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"

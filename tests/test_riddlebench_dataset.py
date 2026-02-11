@@ -44,7 +44,10 @@ def test_riddlebench_dataset_builds_prompt(monkeypatch) -> None:
     assert captured["split"] == "train"
     assert isinstance(sample, EnvBase)
     assert sample.prompt[0]["role"] == "system"
-    assert sample.prompt[1] == {"role": "user", "content": "1, 2, ?, 4"}
+    assert "\\boxed" in sample.prompt[0]["content"]
+    assert sample.prompt[1]["role"] == "user"
+    assert sample.prompt[1]["content"].startswith("1, 2, ?, 4")
+    assert "\\boxed" in sample.prompt[1]["content"]
     assert sample.answer == "3"
 
 
@@ -69,7 +72,7 @@ def test_riddlebench_dataset_filters_task_types_and_eval_split(monkeypatch) -> N
     )
 
     assert len(dataset) == 1
-    assert dataset[0].prompt[1]["content"] == "q3"
+    assert dataset[0].prompt[1]["content"].startswith("q3")
 
 
 def test_riddlebench_dataset_invalid_args_raise(monkeypatch) -> None:
@@ -99,5 +102,33 @@ def test_riddlebench_env_reward_handles_boxed_and_casefold() -> None:
 
     assert env.get_reward("\\boxed{d}") == 1.0
     assert env.get_reward(" d ") == 1.0
+    assert env.get_reward("Answer: D. option text") == 1.0
+    assert env.get_reward("Option (d)") == 1.0
     assert env.get_reward("C") == 0.0
     assert env.get_reward(None) == 0.0
+
+
+def test_riddlebench_env_reward_handles_numeric_and_tuple_answers() -> None:
+    numeric_env = RiddleBenchEnv(
+        prompt=[{"role": "user", "content": "Puzzle"}],
+        answer="5435",
+    )
+    tuple_env = RiddleBenchEnv(
+        prompt=[{"role": "user", "content": "Puzzle"}],
+        answer="22, 28",
+    )
+
+    assert numeric_env.get_reward("The answer is 5435.") == 1.0
+    assert numeric_env.get_reward("54350") == 0.0
+    assert tuple_env.get_reward("\\boxed{22,28}") == 1.0
+    assert tuple_env.get_reward("Final answer: 22, 28.") == 1.0
+    assert tuple_env.get_reward("22, 27") == 0.0
+
+
+def test_riddlebench_env_does_not_accept_prompt_echo_for_mcq() -> None:
+    env = RiddleBenchEnv(
+        prompt=[{"role": "user", "content": "Puzzle"}],
+        answer="B",
+    )
+    echoed = "Question text A. alpha B. beta C. gamma D. delta E. epsilon"
+    assert env.get_reward(echoed) == 0.0

@@ -52,6 +52,8 @@ def sample_completions_batch_hf(
     generation_args: dict[str, Any],
     return_attention_mask: bool = False,
 ) -> CompletionBatch | CompletionBatchWithMask:
+    generate_model = model.module if hasattr(model, "module") else model
+
     formatted_prompts = [
         tokenizer.apply_chat_template(
             env.prompt,
@@ -68,7 +70,7 @@ def sample_completions_batch_hf(
         input_tokens = tokenizer(formatted_prompts, return_tensors="pt", padding=True)
     finally:
         tokenizer.padding_side = original_padding_side
-    model_device = next(model.parameters()).device
+    model_device = next(generate_model.parameters()).device
     input_ids = input_tokens["input_ids"].to(model_device)
     attention_mask = input_tokens["attention_mask"].to(model_device)
     input_length = int(input_ids.shape[1])
@@ -92,7 +94,7 @@ def sample_completions_batch_hf(
     gen_kwargs["return_dict_in_generate"] = True
 
     with torch.no_grad():
-        outputs = cast(GenerateOutput, model.generate(**gen_kwargs))
+        outputs = cast(GenerateOutput, generate_model.generate(**gen_kwargs))
 
     generated_sequences = outputs.sequences
     ret_texts: list[str] = []
