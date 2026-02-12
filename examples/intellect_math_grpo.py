@@ -25,6 +25,7 @@ def main() -> None:
         model="Qwen/Qwen2.5-0.5B-Instruct",
         train_dataset=train_dataset,
         num_steps=5,
+        num_epochs=1,
         saving_steps=5,
         logging_steps=1,
         eval_steps=1,

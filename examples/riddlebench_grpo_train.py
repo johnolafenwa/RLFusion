@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, required=True, help="Base model id or checkpoint path.")
     parser.add_argument("--output-dir", type=str, default="./outputs/grpo_riddlebench")
     parser.add_argument("--num-steps", type=int, default=400)
+    parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--saving-steps", type=int, default=100)
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--eval-steps", type=int, default=100)
@@ -71,6 +72,7 @@ def main() -> None:
         model=args.model,
         train_dataset=train_dataset,
         num_steps=args.num_steps,
+        num_epochs=args.num_epochs,
         saving_steps=args.saving_steps,
         logging_steps=args.logging_steps,
         eval_steps=args.eval_steps,

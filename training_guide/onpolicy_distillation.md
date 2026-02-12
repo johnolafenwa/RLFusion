@@ -1,5 +1,7 @@
 # On-Policy Distillation Training Guide
 
+Reference method: [Thinking Machines on-policy distillation](https://thinkingmachines.ai/blog/on-policy-distillation/)
+
 Recommended starting point:
 - student model: `Qwen/Qwen2.5-0.5B-Instruct`
 - teacher model: `Qwen/Qwen2.5-1.5B-Instruct` (or larger)
@@ -12,11 +14,20 @@ Recommended starting point:
 - batch size: 1 to 4 (per device)
 - max grad norm: 1.0
 
+Objective (aligned with the reference method):
+1. Sample completions from the student.
+2. Compute student and teacher token log-probs on those sampled completions.
+3. Build completion-only masks (prompt tokens excluded).
+4. Use token-level advantage `logp_teacher - logp_student_old`.
+5. Apply PPO-style clipping with `clip_eps` for stable updates across `ppo_steps`.
+
 Notes:
 - Use a stronger teacher for better distillation signal.
 - If reverse KL is noisy, lower temperature or reduce max new tokens.
 - Set `eval_steps` and pass an `eval_dataset` to run reward evaluation during training.
 - `eval_dataset` items must implement `get_reward`.
+- Reward metrics are only computed when sample `answer` is populated; distillation loss itself does not require reward.
+- If generation stops immediately, the trainer still keeps a one-token completion mask so the sample contributes distillation signal.
 - For multi-GPU, run with `accelerate launch` and set `use_accelerate=True`.
 
 ## Distributed Training (Accelerate)

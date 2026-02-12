@@ -51,6 +51,7 @@ class SFTTrainer:
         logging_steps: int,
         eval_steps: Optional[int],
         max_seq_len: Optional[int],
+        num_epochs: int | None = None,
     ) -> None:
         if num_steps <= 0:
             raise ValueError("num_steps must be >= 1.")
@@ -64,6 +65,8 @@ class SFTTrainer:
             raise ValueError("eval_steps must be >= 1 or None.")
         if max_seq_len is not None and max_seq_len <= 0:
             raise ValueError("max_seq_len must be >= 1 or None.")
+        if num_epochs is not None and num_epochs <= 0:
+            raise ValueError("num_epochs must be >= 1 or None.")
 
     def __init__(
         self,
@@ -74,6 +77,7 @@ class SFTTrainer:
         saving_steps: int = 10,
         logging_steps: int = 10,
         eval_steps: Optional[int] = None,
+        num_epochs: int | None = None,
         eval_dataset: Optional[Sequence[EnvBase]] = None,
         eval_sample_completions: bool = False,
         max_new_tokens: int = 256,
@@ -103,6 +107,7 @@ class SFTTrainer:
             logging_steps=logging_steps,
             eval_steps=eval_steps,
             max_seq_len=max_seq_len,
+            num_epochs=num_epochs,
         )
 
         self.accelerator = None
@@ -118,6 +123,7 @@ class SFTTrainer:
         self.train_dataset = train_dataset
         self.num_steps = num_steps
         self.batch_size = batch_size
+        self.num_epochs = num_epochs
         self.saving_steps = saving_steps
         self.logging_steps = logging_steps
         self.output_dir = Path(output_dir)
@@ -235,6 +241,14 @@ class SFTTrainer:
                 )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.num_epochs is None:
+            self._num_steps = self.num_steps
+        else:
+            dataset_len = len(self.train_dataset)
+            if dataset_len <= 0:
+                raise ValueError("Dataset is empty.")
+            self._num_steps = max(1, math.ceil(dataset_len / self.batch_size)) * self.num_epochs
 
     def _configure_logging(self, log_level: int) -> None:
         configure_logging(logger, log_level)
@@ -440,14 +454,35 @@ class SFTTrainer:
                 raise ValueError("Eval dataset is empty.")
 
         self.model.train()
+        if self.num_epochs is None:
+            self._num_steps = self.num_steps
+            steps_per_epoch = 0
+            epoch_indices: list[int] = []
+        else:
+            steps_per_epoch = max(1, math.ceil(dataset_len / self.batch_size))
+            self._num_steps = steps_per_epoch * self.num_epochs
+            epoch_indices = list(range(dataset_len))
 
-        for step in range(self.num_steps):
+        assert self._num_steps is not None
+        for step in range(self._num_steps):
             max_resample_attempts = 8
             input_ids = torch.empty((0, 0), dtype=torch.long)
             attention_mask = torch.empty((0, 0), dtype=torch.long)
             labels = torch.empty((0, 0), dtype=torch.long)
             for _attempt in range(max_resample_attempts):
-                indices = [random.randint(0, dataset_len - 1) for _ in range(self.batch_size)]
+                if self.num_epochs is None:
+                    indices = [random.randint(0, dataset_len - 1) for _ in range(self.batch_size)]
+                else:
+                    if _attempt == 0:
+                        if step % steps_per_epoch == 0:
+                            random.shuffle(epoch_indices)
+                        start = (step % steps_per_epoch) * self.batch_size
+                        indices = epoch_indices[start : start + self.batch_size]
+                        if not indices:
+                            raise ValueError("Epoch sampling produced an empty batch.")
+                    else:
+                        indices = [random.randint(0, dataset_len - 1) for _ in range(self.batch_size)]
+
                 batch_samples = [self.train_dataset[i] for i in indices]
 
                 prompts = []

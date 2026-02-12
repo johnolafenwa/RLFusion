@@ -2,6 +2,7 @@
 
 import importlib
 import logging
+import math
 import random
 from pathlib import Path
 from typing import Optional, List, Tuple, Any, cast, Protocol, TypeVar
@@ -57,6 +58,7 @@ class GRPOTrainer():
     def _validate_init_args(
         *,
         num_steps: int,
+        num_epochs: int | None = None,
         saving_steps: int,
         logging_steps: int,
         eval_steps: Optional[int],
@@ -70,6 +72,8 @@ class GRPOTrainer():
     ) -> None:
         if num_steps <= 0:
             raise ValueError("num_steps must be >= 1.")
+        if num_epochs is not None and num_epochs <= 0:
+            raise ValueError("num_epochs must be >= 1 or None.")
         if saving_steps <= 0:
             raise ValueError("saving_steps must be >= 1.")
         if logging_steps <= 0:
@@ -95,6 +99,7 @@ class GRPOTrainer():
                  model: str,
                  train_dataset: Optional[DatasetLike[Any]],
                  num_steps: int = 100,
+                 num_epochs: int | None = None,
                  saving_steps: int = 10,
                  logging_steps: int = 10,
                  eval_steps: Optional[int] = None,
@@ -126,6 +131,7 @@ class GRPOTrainer():
                  ):
         self._validate_init_args(
             num_steps=num_steps,
+            num_epochs=num_epochs,
             saving_steps=saving_steps,
             logging_steps=logging_steps,
             eval_steps=eval_steps,
@@ -153,6 +159,7 @@ class GRPOTrainer():
         self.kl_penalty = kl_penalty
         self.output_dir = Path(output_dir)
         self.num_steps = num_steps
+        self.num_epochs = num_epochs
         self.saving_steps = saving_steps
         self.logging_steps = logging_steps
         self.max_new_tokens = max_new_tokens
@@ -242,6 +249,7 @@ class GRPOTrainer():
                         "device": device,
                         "device_map": device_map,
                         "num_steps": num_steps,
+                        "num_epochs": num_epochs,
                         "saving_steps": saving_steps,
                         "logging_steps": logging_steps,
                         "eval_steps": eval_steps,
@@ -294,6 +302,7 @@ class GRPOTrainer():
                 )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._num_steps: Optional[int] = None
 
 
     def _configure_logging(self, log_level: int) -> None:
@@ -576,8 +585,32 @@ class GRPOTrainer():
         if self.ref_model is not None:
             self.ref_model.eval()
 
-        for step in range(self.num_steps):
-            env_batch = [self.train_dataset[random.randint(0, dataset_len - 1)] for _ in range(self.batch_size)]
+        if self.num_epochs is None:
+            self._num_steps = self.num_steps
+            steps_per_epoch = 0
+            epoch_indices: list[int] = []
+        else:
+            steps_per_epoch = max(1, math.ceil(dataset_len / self.batch_size))
+            self._num_steps = steps_per_epoch * self.num_epochs
+            epoch_indices = list(range(dataset_len))
+
+        assert self._num_steps is not None
+
+        for step in range(self._num_steps):
+            if self.num_epochs is None:
+                env_batch = [
+                    self.train_dataset[random.randint(0, dataset_len - 1)]
+                    for _ in range(self.batch_size)
+                ]
+            else:
+                if step % steps_per_epoch == 0:
+                    random.shuffle(epoch_indices)
+                start = (step % steps_per_epoch) * self.batch_size
+                batch_indices = epoch_indices[start : start + self.batch_size]
+                if not batch_indices:
+                    raise ValueError("Epoch sampling produced an empty batch.")
+                env_batch = [self.train_dataset[idx] for idx in batch_indices]
+
             envs = []
             for env in env_batch:
                 envs.extend([env for _ in range(self.group_size)])

@@ -58,6 +58,7 @@ Flow:
 2. Student and teacher log-probs are computed with `get_log_probs`, using a full attention mask
    from `build_full_attention_mask` to ignore prompt padding.
 3. `_build_masks` creates a completion-only mask so the KL focuses on generated tokens.
+   - If generation stops immediately (completion length 0), the trainer still keeps the first generated token in-mask so the sample contributes a distillation signal.
 4. Reverse KL is computed per token; its negative acts as the advantage signal.
 5. A PPO-style clipped update step applies the distillation signal while keeping training stable.
 

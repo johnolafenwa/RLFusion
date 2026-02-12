@@ -3,6 +3,7 @@ from rlfusion.trainers import SFTTrainer
 
 
 def main():
+    num_epochs = 1
 
     train_dataset = CapyBaraSFTDataset(
         train=True
@@ -17,6 +18,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         num_steps=300,
+        num_epochs=num_epochs,
         eval_steps=50,
         saving_steps=50,
         logging_steps=10,
@@ -31,4 +33,3 @@ def main():
 if __name__ == "__main__":
 
     main()
-

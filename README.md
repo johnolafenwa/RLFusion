@@ -156,7 +156,12 @@ trainer.train()
 ```
 
 ### On-policy Distillation
-`OnPolicyDistillationTrainer` samples from the student and minimizes reverse KL to a fixed teacher distribution over completion tokens. To evaluate during training, set `eval_steps` and pass an `eval_dataset` of environments with `get_reward`.
+`OnPolicyDistillationTrainer` follows the on-policy distillation recipe:
+- sample trajectories from the student policy
+- score sampled completion tokens under student and teacher
+- optimize a PPO-style objective with token-level advantage `logp_teacher - logp_student_old`
+
+This is distillation (no external RL reward in the loss). Reward logging during train/eval is optional and only used for monitoring.
 
 ```python
 from rlfusion.datasets import MathDataset
@@ -174,15 +179,25 @@ trainer = OnPolicyDistillationTrainer(
     logging_steps=1,
     eval_steps=1,
     eval_dataset=eval_dataset,
+    sampling_temperature=0.7,
+    generation_args={"top_p": 0.9},
+    ppo_steps=1,
+    clip_eps=0.2,
     max_new_tokens=64,
+    max_grad_norm=1.0,
 )
 trainer.train()
 ```
+
+Notes:
+- For reward metrics, `eval_dataset` environments should implement `get_reward`, and samples should have `answer` populated.
+- In `trainer.test(...)`, `num_batches` must be `>= 1` when set, and `eval_temperature` must be `> 0` when set.
 
 ## Training Guides
 - SFT: `training_guide/sft.md`
 - GRPO: `training_guide/grpo.md`
 - On-policy distillation: `training_guide/onpolicy_distillation.md`
+- Reasoning pipeline (dataset-specific): `examples/reasoning/README.md`
 
 ## Testing
 ```bash

@@ -2,10 +2,10 @@
 
 import importlib
 import logging
+import math
 import random
-from collections.abc import Sequence
 from pathlib import Path
-from typing import Optional, List, Tuple, Any, cast
+from typing import Optional, List, Tuple, Any, cast, Protocol, TypeVar
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +33,7 @@ from rlfusion.trainers.utils import (
     truncate_text,
     format_prompt,
     resolve_attention_implementation,
+    get_tokenizer_compat_kwargs,
     build_full_attention_mask,
 )
 from rlfusion.trainers.common import configure_logging, is_main_process, unwrap_model_for_saving
@@ -44,17 +45,64 @@ else:
     logger.info("Liger kernel not installed, defaulting to HF")
 
 
+_SampleT = TypeVar("_SampleT", covariant=True)
+
+
+class DatasetLike(Protocol[_SampleT]):
+    def __len__(self) -> int: ...
+    def __getitem__(self, index: int) -> _SampleT: ...
+
+
 class OnPolicyDistillationTrainer:
+    @staticmethod
+    def _validate_init_args(
+        *,
+        num_steps: int,
+        num_epochs: int | None = None,
+        saving_steps: int,
+        logging_steps: int,
+        eval_steps: Optional[int],
+        sampling_temperature: float,
+        max_new_tokens: int,
+        batch_size: int,
+        ppo_steps: int,
+        clip_eps: float,
+        max_grad_norm: Optional[float],
+    ) -> None:
+        if num_steps <= 0:
+            raise ValueError("num_steps must be >= 1.")
+        if num_epochs is not None and num_epochs <= 0:
+            raise ValueError("num_epochs must be >= 1 or None.")
+        if saving_steps <= 0:
+            raise ValueError("saving_steps must be >= 1.")
+        if logging_steps <= 0:
+            raise ValueError("logging_steps must be >= 1.")
+        if eval_steps is not None and eval_steps <= 0:
+            raise ValueError("eval_steps must be >= 1 or None.")
+        if sampling_temperature <= 0.0:
+            raise ValueError("sampling_temperature must be > 0.")
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be >= 1.")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be >= 1.")
+        if ppo_steps <= 0:
+            raise ValueError("ppo_steps must be >= 1.")
+        if clip_eps < 0.0:
+            raise ValueError("clip_eps must be >= 0.")
+        if max_grad_norm is not None and max_grad_norm <= 0:
+            raise ValueError("max_grad_norm must be > 0 or None.")
+
     def __init__(
         self,
         model: str,
         teacher_model: str,
-        train_dataset: Sequence[Any],
+        train_dataset: DatasetLike[EnvBase],
         num_steps: int = 100,
+        num_epochs: int | None = None,
         saving_steps: int = 10,
         logging_steps: int = 10,
         eval_steps: Optional[int] = None,
-        eval_dataset: Optional[Sequence[EnvBase]] = None,
+        eval_dataset: Optional[DatasetLike[EnvBase]] = None,
         enable_wandb: bool = False,
         wandb_project: str = "onpolicy_distill",
         wandb_run_name: Optional[str] = None,
@@ -76,6 +124,20 @@ class OnPolicyDistillationTrainer:
         log_level: int = logging.INFO,
         use_accelerate: bool = False,
     ):
+        self._validate_init_args(
+            num_steps=num_steps,
+            num_epochs=num_epochs,
+            saving_steps=saving_steps,
+            logging_steps=logging_steps,
+            eval_steps=eval_steps,
+            sampling_temperature=sampling_temperature,
+            max_new_tokens=max_new_tokens,
+            batch_size=batch_size,
+            ppo_steps=ppo_steps,
+            clip_eps=clip_eps,
+            max_grad_norm=max_grad_norm,
+        )
+
         self.accelerator = None
         if use_accelerate:
             from accelerate import Accelerator
@@ -88,6 +150,7 @@ class OnPolicyDistillationTrainer:
 
         self.train_dataset = train_dataset
         self.num_steps = num_steps
+        self.num_epochs = num_epochs
         self.saving_steps = saving_steps
         self.logging_steps = logging_steps
         self.sampling_temperature = sampling_temperature
@@ -101,14 +164,16 @@ class OnPolicyDistillationTrainer:
         self.max_log_chars = max_log_chars
         self.max_grad_norm = max_grad_norm
 
-        if eval_steps is not None and eval_steps <= 0:
-            raise ValueError("eval_steps must be >= 1 or None.")
         self.eval_steps = eval_steps
         self.eval_dataset = eval_dataset
 
         device = get_device()
         if device == "cuda":
-            device_map = "auto"
+            if self.accelerator is None:
+                device_map: str | dict[str, int] = "auto"
+            else:
+                # In distributed mode each rank owns one device.
+                device_map = {"": int(self.accelerator.local_process_index)}
             configure_torch_backends()
         else:
             device_map = device
@@ -116,7 +181,8 @@ class OnPolicyDistillationTrainer:
         self.device = device
         self.device_map = device_map
 
-        attn_implementation = resolve_attention_implementation(device_map)
+        attn_device_map = "auto" if device_map == "auto" else "manual"
+        attn_implementation = resolve_attention_implementation(attn_device_map)
         model_kwargs: dict[str, Any] = {
             "device_map": device_map,
             "attn_implementation": attn_implementation,
@@ -137,7 +203,8 @@ class OnPolicyDistillationTrainer:
         for param in self.teacher_model.parameters():
             param.requires_grad_(False)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model)
+        tokenizer_kwargs = get_tokenizer_compat_kwargs(model)
+        self.tokenizer = AutoTokenizer.from_pretrained(model, **tokenizer_kwargs)
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"
@@ -156,6 +223,7 @@ class OnPolicyDistillationTrainer:
                         "device": device,
                         "device_map": device_map,
                         "num_steps": num_steps,
+                        "num_epochs": num_epochs,
                         "saving_steps": saving_steps,
                         "logging_steps": logging_steps,
                         "eval_steps": eval_steps,
@@ -199,6 +267,14 @@ class OnPolicyDistillationTrainer:
                 )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self._num_steps: Optional[int] = None
+        if self.num_epochs is None:
+            self._num_steps = self.num_steps
+        else:
+            dataset_len = len(self.train_dataset)
+            if dataset_len <= 0:
+                raise ValueError("Dataset is empty.")
+            self._num_steps = max(1, math.ceil(dataset_len / self.batch_size)) * self.num_epochs
 
     def _configure_logging(self, log_level: int) -> None:
         configure_logging(logger, log_level)
@@ -291,8 +367,12 @@ class OnPolicyDistillationTrainer:
         sequence_lengths = [int(seq.numel()) for seq in sequence_ids]
         masks = []
         for prompt_len, completion_len, seq_len in zip(prompt_lengths, completion_lengths, sequence_lengths):
+            prompt_len = int(prompt_len)
             if completion_len is None:
                 completion_len = max(seq_len - prompt_len, 0)
+            completion_len = int(completion_len)
+            if completion_len <= 0 and seq_len > prompt_len:
+                completion_len = 1
             end_len = min(prompt_len + completion_len, seq_len)
             start = max(prompt_len - 1, 0)
             end = max(end_len - 2, -1)
@@ -385,7 +465,13 @@ class OnPolicyDistillationTrainer:
             return None
         if completion_text is None:
             return None
-        return float(env.get_reward(completion_text))
+        reward_value = env.get_reward(completion_text)
+        if reward_value is None:
+            return None
+        reward = float(reward_value)
+        if not math.isfinite(reward):
+            return None
+        return reward
 
     def train(self) -> None:
         dataset_len = len(self.train_dataset)
@@ -400,8 +486,29 @@ class OnPolicyDistillationTrainer:
         self.model.train()
         self.teacher_model.eval()
 
-        for step in range(self.num_steps):
-            env_batch = [self.train_dataset[random.randint(0, dataset_len - 1)] for _ in range(self.batch_size)]
+        if self.num_epochs is None:
+            self._num_steps = self.num_steps
+            steps_per_epoch = 0
+            epoch_indices: list[int] = []
+        else:
+            steps_per_epoch = max(1, math.ceil(dataset_len / self.batch_size))
+            self._num_steps = steps_per_epoch * self.num_epochs
+            epoch_indices = list(range(dataset_len))
+
+        for step in range(self._num_steps):
+            if self.num_epochs is None:
+                env_batch = [
+                    self.train_dataset[random.randint(0, dataset_len - 1)]
+                    for _ in range(self.batch_size)
+                ]
+            else:
+                if step % steps_per_epoch == 0:
+                    random.shuffle(epoch_indices)
+                start = (step % steps_per_epoch) * self.batch_size
+                batch_indices = epoch_indices[start : start + self.batch_size]
+                if not batch_indices:
+                    raise ValueError("Epoch sampling produced an empty batch.")
+                env_batch = [self.train_dataset[idx] for idx in batch_indices]
 
             sequences, texts, _prompt_lens, completion_lens, input_attention_mask = (
                 self._sample_completions_batch_with_mask(env_batch)
@@ -507,13 +614,17 @@ class OnPolicyDistillationTrainer:
 
     def test(
         self,
-        dataset: Optional[Sequence[Any]] = None,
+        dataset: Optional[DatasetLike[EnvBase]] = None,
         num_batches: Optional[int] = None,
         step: Optional[int] = None,
         eval_temperature: Optional[float] = None,
     ) -> dict:
         if dataset is None:
             raise ValueError("dataset is required for testing.")
+        if num_batches is not None and num_batches <= 0:
+            raise ValueError("num_batches must be >= 1 or None.")
+        if eval_temperature is not None and eval_temperature <= 0:
+            raise ValueError("eval_temperature must be > 0 or None.")
         eval_dataset = dataset
         dataset_len = len(eval_dataset)
         if dataset_len == 0:

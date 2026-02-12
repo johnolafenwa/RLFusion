@@ -13,6 +13,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B-Base")
     parser.add_argument("--output-dir", type=str, default="./outputs/ultrachat_sft_qwen3_0_6b")
     parser.add_argument("--num-steps", type=int, default=1_000)
+    parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--train-max-samples", type=int, default=20_000)
     parser.add_argument("--eval-max-samples", type=int, default=2_000)
@@ -48,6 +49,7 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         num_steps=args.num_steps,
+        num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         eval_steps=args.eval_steps,
         saving_steps=args.saving_steps,
