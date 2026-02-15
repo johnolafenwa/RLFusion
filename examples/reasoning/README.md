@@ -1,35 +1,43 @@
-# Reasoning Pipeline: Superior Reasoning SFT → GRPO → AIME2025 Evaluation
+# Reasoning Pipeline: SFT → GRPO → AIME2025 Evaluation
 
 This folder provides an end-to-end flow:
 
-1. SFT on `Alibaba-Apsara/Superior-Reasoning-SFT-gpt-oss-120b` (`stage1` split)
-2. GRPO on `nvidia/AceReason-Math` using the SFT checkpoint
+1. SFT on `johnolafenwa/reasoning-sft` (`train` / `test` splits)
+2. GRPO on `johnolafenwa/reasoning-rl` using the SFT checkpoint
 3. AIME2025 evaluation on base/SFT/GRPO checkpoints
 
 Scripts:
 
-- `superior_reasoning_sft_train.py`
-- `ace_reason_grpo_train.py`
+- `reasoning_sft_train.py`
+- `reasoning_grpo_train.py`
 - `aime2025_evaluate.py`
 
 ## 1) Install and run SFT
 
-`superior_reasoning_sft_train.py` uses only `stage1` and internally splits it into 90/10 train/test (`split_ratio`, default 0.9).  
-It does **not** run training-set evaluation by default.
+`reasoning_sft_train.py` uses native splits from `johnolafenwa/reasoning-sft`:
+
+- `train` for training
+- `test` for evaluation
+
+Data mapping is strict:
+
+- `input` → user prompt message
+- `output` → assistant target message
 
 ```bash
-python /Users/johnolafenwa/source/rlfusion/RLFusion/examples/reasoning/superior_reasoning_sft_train.py \
+python /Users/johnolafenwa/source/rlfusion/RLFusion/examples/reasoning/reasoning_sft_train.py \
   --model Qwen/Qwen3-8B-Base \
-  --output-dir ./outputs/reasoning/superior_reasoning_sft \
+  --output-dir ./outputs/reasoning/reasoning_sft \
   --num-epochs 3 \
   --batch-size 1 \
   --train-max-samples 20000 \
+  --test-max-samples 2000 \
+  --eval-steps 100 \
   --saving-steps 100 \
   --logging-steps 10 \
   --max-seq-len 4096 \
   --lr 1e-5 \
-  --seed 42 \
-  --split-ratio 0.9
+  --seed 42
 ```
 
 Tips:
@@ -38,9 +46,9 @@ Tips:
 - `save_final_only` defaults to `True`, so the run saves only the `final` checkpoint.
 - Pass `--no-save-final-only` if you need intermediate `step_<N>` checkpoints.
 
-## 2) GRPO on AceReason-Math
+## 2) GRPO on reasoning-rl
 
-`ace_reason_grpo_train.py` starts from SFT checkpoint and applies reward that requires **all**:
+`reasoning_grpo_train.py` starts from SFT checkpoint and applies reward that requires **all**:
 
 1. response starts with `<think>` (case-sensitive)
 2. includes `</think>`
@@ -48,10 +56,20 @@ Tips:
 4. `\boxed{...}` exists in text after `</think>`
 5. boxed answer exactly equals dataset answer (`get_boxed_answer(... )` match, case-sensitive)
 
+Dataset uses native splits from `johnolafenwa/reasoning-rl`:
+
+- `train` for GRPO updates
+- `test` for periodic evaluation
+
+Data mapping is strict:
+
+- `problem` → user prompt message
+- `answer` → target answer used by reward matching
+
 ```bash
-python /Users/johnolafenwa/source/rlfusion/RLFusion/examples/reasoning/ace_reason_grpo_train.py \
-  --sft-checkpoint /Users/johnolafenwa/source/rlfusion/RLFusion/outputs/reasoning/superior_reasoning_sft/final \
-  --output-dir ./outputs/reasoning/ace_reason_grpo \
+python /Users/johnolafenwa/source/rlfusion/RLFusion/examples/reasoning/reasoning_grpo_train.py \
+  --sft-checkpoint /Users/johnolafenwa/source/rlfusion/RLFusion/outputs/reasoning/reasoning_sft/final \
+  --output-dir ./outputs/reasoning/reasoning_grpo \
   --num-epochs 1 \
   --batch-size 1 \
   --group-size 4 \
@@ -61,6 +79,8 @@ python /Users/johnolafenwa/source/rlfusion/RLFusion/examples/reasoning/ace_reaso
   --top-p 0.9 \
   --learning-rate 1e-5 \
   --train-max-samples 5000 \
+  --test-max-samples 500 \
+  --eval-steps 100 \
   --saving-steps 50 \
   --logging-steps 5 \
   --seed 42
@@ -69,7 +89,7 @@ python /Users/johnolafenwa/source/rlfusion/RLFusion/examples/reasoning/ace_reaso
 KL baseline is off by default. Enable with:
 
 ```bash
-python .../ace_reason_grpo_train.py --use-base-kl --kl-penalty 0.02
+python .../reasoning_grpo_train.py --use-base-kl --kl-penalty 0.02
 ```
 
 ## 3) Evaluate checkpoints on AIME2025
@@ -82,11 +102,11 @@ python /Users/johnolafenwa/source/rlfusion/RLFusion/examples/reasoning/aime2025_
   --output-dir ./outputs/reasoning/aime_eval_base
 
 python /Users/johnolafenwa/source/rlfusion/RLFusion/examples/reasoning/aime2025_evaluate.py \
-  --model /Users/.../outputs/reasoning/superior_reasoning_sft/final \
+  --model /Users/.../outputs/reasoning/reasoning_sft/final \
   --output-dir ./outputs/reasoning/aime_eval_sft
 
 python /Users/johnolafenwa/source/rlfusion/RLFusion/examples/reasoning/aime2025_evaluate.py \
-  --model /Users/.../outputs/reasoning/ace_reason_grpo/final \
+  --model /Users/.../outputs/reasoning/reasoning_grpo/final \
   --output-dir ./outputs/reasoning/aime_eval_grpo
 ```
 
@@ -97,6 +117,6 @@ Outputs are written to:
 
 ## Notes
 
-- SFT uses only `stage1`, with a 90/10 internal split for training/test bookkeeping.
-- GRPO and SFT scripts now accept both `--num-steps` (legacy) and `--num-epochs` (preferred for full data coverage).
-- Evaluation data is not used during SFT in this flow.
+- SFT and GRPO now both use dataset-native `train` / `test` splits with no custom split logic.
+- GRPO and SFT scripts support both `--num-steps` (legacy) and `--num-epochs` (preferred for full data coverage).
+- Both scripts support periodic evaluation via `--eval-steps`.

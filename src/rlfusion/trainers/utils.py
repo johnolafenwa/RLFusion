@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 import random
 from pathlib import Path
 from typing import Optional, Sequence, Any
@@ -42,6 +43,9 @@ def configure_torch_backends():
 
 
 def resolve_attention_implementation(device_map: object) -> str:
+    forced_attn_impl = os.getenv("RLFUSION_ATTN_IMPLEMENTATION")
+    if forced_attn_impl:
+        return forced_attn_impl
     if device_map != "auto":
         return "sdpa"
     if not torch.cuda.is_available():

@@ -499,11 +499,12 @@ class SFTTrainer:
             if input_ids.size(0) == 0:
                 logger.warning(
                     (
-                        "Skipping step %d because all sampled examples were dropped "
+                        "Skipping step %d/%d because all sampled examples were dropped "
                         "for exceeding max_seq_len after %d attempts. Consider "
                         "increasing max_seq_len."
                     ),
                     step + 1,
+                    self._num_steps,
                     max_resample_attempts,
                 )
                 continue
@@ -534,7 +535,7 @@ class SFTTrainer:
             if (step + 1) % self.logging_steps == 0:
                 loss_val = float(loss.item())
                 if self._is_main_process():
-                    logger.info("step %d loss=%.6f", step + 1, loss_val)
+                    logger.info("step %d/%d loss=%.6f", step + 1, self._num_steps, loss_val)
                 if self._wandb is not None:
                     self._wandb.log(
                         {

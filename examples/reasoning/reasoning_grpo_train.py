@@ -1,4 +1,4 @@
-"""GRPO on AceReason-Math with strict reasoning-format reward.
+"""GRPO on johnolafenwa/reasoning-rl with strict reasoning-format reward.
 
 Expected answer format:
   <think>...</think> \boxed{answer}
@@ -24,7 +24,7 @@ from rlfusion.utils import get_boxed_answer
 
 
 @dataclass
-class AceReasonMathEnv(EnvBase):
+class ReasoningRLEnv(EnvBase):
     def get_reward(self, prediction: str | None) -> float:
         if prediction is None or self.answer is None:
             return 0.0
@@ -55,18 +55,26 @@ class AceReasonMathEnv(EnvBase):
         return 1.0 if boxed == str(self.answer) else 0.0
 
 
-class AceReasonMathDataset(Dataset):
-    """Adapter for nvidia/AceReason-Math (train split only)."""
+class ReasoningRLDataset(Dataset):
+    """Adapter for johnolafenwa/reasoning-rl."""
 
-    def __init__(self, max_samples: Optional[int] = None, seed: Optional[int] = None):
+    def __init__(
+        self,
+        split: str,
+        max_samples: Optional[int] = None,
+        seed: Optional[int] = None,
+    ):
         try:
             from datasets import load_dataset
         except ImportError as exc:
             raise ImportError(
-                "datasets is required for AceReasonMathDataset. Install with: uv pip install datasets"
+                "datasets is required for ReasoningRLDataset. Install with: uv pip install datasets"
             ) from exc
 
-        dataset = load_dataset("nvidia/AceReason-Math", split="train")
+        if split not in {"train", "test"}:
+            raise ValueError("split must be 'train' or 'test'.")
+
+        dataset = load_dataset("johnolafenwa/reasoning-rl", split=split)
         if seed is not None:
             dataset = dataset.shuffle(seed=seed)
 
@@ -75,61 +83,35 @@ class AceReasonMathDataset(Dataset):
 
         self.dataset = dataset
 
-    @staticmethod
-    def _to_text(value: object) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        return str(value)
-
-    @staticmethod
-    def _pick_str_field(row: dict[str, object], *keys: str) -> Optional[str]:
-        for key in keys:
-            value = row.get(key)
-            if value is not None:
-                return str(value)
-        return None
-
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, index: int) -> AceReasonMathEnv:
+    def __getitem__(self, index: int) -> ReasoningRLEnv:
         row = self.dataset[index]
+        if row.get("problem") is None:
+            raise ValueError("Dataset row missing required field: problem.")
+        if row.get("answer") is None:
+            raise ValueError("Dataset row missing required field: answer.")
+        prompt_text = str(row["problem"])
+        answer = str(row["answer"])
 
-        prompt_parts: list[str] = []
-        prompt_text = self._pick_str_field(row, "question", "prompt", "instruction", "input")
-        if prompt_text is not None:
-            prompt_parts.append(prompt_text)
-
-        extra_context = row.get("context")
-        if extra_context is not None:
-            prompt_parts.append(self._to_text(extra_context))
-
-        if not prompt_parts:
-            raise ValueError("Dataset row missing a usable prompt field (question/prompt/instruction/input).")
-
-        answer = self._pick_str_field(row, "answer", "label", "target", "gold", "ground_truth")
-        if answer is None:
-            raise ValueError("Dataset row missing an answer field (answer/label/target/gold/ground_truth).")
-
-        return AceReasonMathEnv(
+        return ReasoningRLEnv(
             prompt=[
-                {"role": "user", "content": "\n\n".join(prompt_parts)}
+                {"role": "user", "content": prompt_text}
             ],
             answer=answer,
         )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run GRPO training on AceReason-Math.")
+    parser = argparse.ArgumentParser(description="Run GRPO training on johnolafenwa/reasoning-rl.")
     parser.add_argument(
         "--sft-checkpoint",
         type=str,
-        default="./outputs/reasoning/superior_reasoning_sft/final",
+        default="./outputs/reasoning/reasoning_sft/final",
         help="Path to SFT checkpoint to use as GRPO base.",
     )
-    parser.add_argument("--output-dir", type=str, default="./outputs/reasoning/ace_reason_grpo")
+    parser.add_argument("--output-dir", type=str, default="./outputs/reasoning/reasoning_grpo")
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--num-steps", type=int, default=500)
     parser.add_argument("--saving-steps", type=int, default=50)
@@ -150,6 +132,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--train-max-samples", type=int, default=5_000)
+    parser.add_argument("--test-max-samples", type=int, default=None)
+    parser.add_argument("--eval-steps", type=int, default=100)
     parser.add_argument("--learning-rate", type=float, default=1e-5)
     parser.add_argument("--log-level", type=int, default=logging.INFO)
     parser.add_argument("--use-accelerate", action="store_true", help="Enable Accelerate multi-process training")
@@ -165,10 +149,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    dataset = AceReasonMathDataset(max_samples=args.train_max_samples, seed=args.seed)
+    train_dataset = ReasoningRLDataset(split="train", max_samples=args.train_max_samples, seed=args.seed)
+    eval_dataset = ReasoningRLDataset(split="test", max_samples=args.test_max_samples, seed=args.seed)
 
     if args.num_epochs is not None:
-        steps_for_checkpoint_interval = math.ceil(len(dataset) / args.batch_size) * args.num_epochs
+        steps_for_checkpoint_interval = math.ceil(len(train_dataset) / args.batch_size) * args.num_epochs
     else:
         steps_for_checkpoint_interval = args.num_steps
     saving_steps = args.saving_steps
@@ -177,12 +162,13 @@ def main() -> None:
 
     trainer = GRPOTrainer(
         model=args.sft_checkpoint,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
         num_steps=args.num_steps,
         num_epochs=args.num_epochs,
         saving_steps=saving_steps,
         logging_steps=args.logging_steps,
-        eval_steps=None,
+        eval_steps=args.eval_steps,
+        eval_dataset=eval_dataset,
         sampling_temperature=args.sampling_temperature,
         kl_penalty=args.kl_penalty if args.use_base_kl else 0.0,
         output_dir=args.output_dir,
