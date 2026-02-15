@@ -143,6 +143,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-log-chars", type=int, default=320)
     parser.add_argument("--use-base-kl", action="store_true", help="Enable KL penalty with a reference model.")
     parser.add_argument("--kl-penalty", type=float, default=0.0)
+    parser.add_argument("--use-vllm", action="store_true", help="Use colocated vLLM engine for generation (faster).")
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5, help="vLLM GPU memory utilization (0-1).")
+    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=1, help="vLLM tensor parallel size.")
+    parser.add_argument("--vllm-enable-sleep", action="store_true", help="Enable vLLM sleep/wake to free GPU memory during training.")
     return parser.parse_args()
 
 
@@ -159,6 +163,13 @@ def main() -> None:
     saving_steps = args.saving_steps
     if args.save_final_only:
         saving_steps = steps_for_checkpoint_interval + 1
+
+    vllm_args = None
+    if args.use_vllm:
+        vllm_args = {
+            "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+            "tensor_parallel_size": args.vllm_tensor_parallel_size,
+        }
 
     trainer = GRPOTrainer(
         model=args.sft_checkpoint,
@@ -187,6 +198,9 @@ def main() -> None:
         enable_wandb=False,
         seed=args.seed,
         use_accelerate=args.use_accelerate,
+        use_vllm=args.use_vllm,
+        vllm_args=vllm_args,
+        vllm_enable_sleep=args.vllm_enable_sleep,
         log_level=args.log_level,
     )
 

@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 
 from rlfusion.envs import EnvBase
 from rlfusion.inference.hf_utils import sample_completions_batch_hf
-from rlfusion.inference.vllm_utils import build_sampling_params, load_vllm_engine
+from rlfusion.inference.vllm_utils import build_sampling_params, load_vllm_engine, sample_completions_batch_vllm
 from rlfusion.trainers.utils import (
     configure_torch_backends,
     format_prompt,
@@ -219,52 +219,13 @@ class Evaluator:
     ) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
         if self._vllm is None:
             raise RuntimeError("vLLM engine is not initialized.")
-
-        formatted_prompts = []
-        for env in envs:
-            formatted_prompt = self.tokenizer.apply_chat_template(
-                env.prompt,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-            formatted_prompts.append(formatted_prompt)
-
         sampling_params = self._build_vllm_sampling_params()
-        outputs = self._vllm.generate(formatted_prompts, sampling_params)
-
-        ret_texts = []
-        completion_lengths = []
-        prompt_lengths = []
-        eos_token_id = self.tokenizer.eos_token_id
-
-        for output in outputs:
-            prompt_token_ids = getattr(output, "prompt_token_ids", None)
-            prompt_lengths.append(0 if prompt_token_ids is None else len(prompt_token_ids))
-
-            if not output.outputs:
-                ret_texts.append("")
-                completion_lengths.append(0)
-                continue
-
-            completion = output.outputs[0]
-            token_ids = getattr(completion, "token_ids", None)
-            if token_ids is None:
-                token_ids = self.tokenizer.encode(completion.text, add_special_tokens=False)
-            token_ids = list(token_ids)
-            end_offset = len(token_ids)
-            if eos_token_id is not None:
-                for idx, token_id in enumerate(token_ids):
-                    if token_id == eos_token_id:
-                        end_offset = idx
-                        break
-
-            completion_token_ids = token_ids[:end_offset]
-            text = self.tokenizer.decode(completion_token_ids, skip_special_tokens=True)
-            ret_texts.append(text)
-            completion_lengths.append(len(completion_token_ids))
-
-        sequences = torch.empty((len(envs), 0), dtype=torch.long)
-        return sequences, ret_texts, prompt_lengths, completion_lengths
+        return sample_completions_batch_vllm(
+            vllm_engine=self._vllm,
+            tokenizer=self.tokenizer,
+            envs=envs,
+            sampling_params=sampling_params,
+        )
 
     def sample_completions_batch(
         self, envs: List[EnvBase]

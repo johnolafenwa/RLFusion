@@ -25,6 +25,14 @@ from transformers import AutoTokenizer
 
 from rlfusion.envs import EnvBase
 from rlfusion.inference.hf_utils import sample_completions_batch_hf
+from rlfusion.inference.vllm_utils import (
+    build_sampling_params,
+    load_vllm_engine,
+    sample_completions_batch_vllm,
+    sync_model_weights_to_vllm,
+    vllm_sleep,
+    vllm_wake_up,
+)
 from rlfusion.trainers.types import AttentionMask, LogProbs, TokenIds
 from rlfusion.trainers.utils import (
     get_device,
@@ -123,6 +131,9 @@ class OnPolicyDistillationTrainer:
         max_grad_norm: Optional[float] = None,
         log_level: int = logging.INFO,
         use_accelerate: bool = False,
+        use_vllm: bool = False,
+        vllm_args: Optional[dict[str, Any]] = None,
+        vllm_enable_sleep: bool = False,
     ):
         self._validate_init_args(
             num_steps=num_steps,
@@ -240,6 +251,9 @@ class OnPolicyDistillationTrainer:
                         "ppo_steps": ppo_steps,
                         "clip_eps": clip_eps,
                         "use_eval_dataset": eval_dataset is not None,
+                        "use_vllm": use_vllm,
+                        "vllm_args": vllm_args,
+                        "vllm_enable_sleep": vllm_enable_sleep,
                     },
                 )
                 self._wandb = wandb
@@ -267,6 +281,21 @@ class OnPolicyDistillationTrainer:
                 )
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # vLLM colocated generation
+        self.use_vllm = use_vllm
+        self.vllm_enable_sleep = vllm_enable_sleep
+        self._vllm_engine: Any = None
+        self._vllm_sampling_params_cls: Any = None
+        self._vllm_sampling_param_keys: Any = None
+        if use_vllm:
+            self._vllm_engine, self._vllm_sampling_params_cls, self._vllm_sampling_param_keys = (
+                load_vllm_engine(model, vllm_args or {})
+            )
+            sync_model_weights_to_vllm(self.model, self._vllm_engine)
+            logger.info("vLLM colocated engine initialized for generation.")
+
+        self._last_synced_step: int = 0
         self._num_steps: Optional[int] = None
         if self.num_epochs is None:
             self._num_steps = self.num_steps
@@ -285,9 +314,26 @@ class OnPolicyDistillationTrainer:
     def _unwrap_model_for_saving(self) -> torch.nn.Module:
         return unwrap_model_for_saving(self.model, self.accelerator)
 
+    def _build_vllm_sampling_params(self) -> Any:
+        return build_sampling_params(
+            self._vllm_sampling_params_cls,
+            self._vllm_sampling_param_keys,
+            generation_args=self.generation_args,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=True,
+            temperature=self.sampling_temperature,
+        )
+
     def sample_completions_batch(
         self, envs: List[EnvBase]
     ) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
+        if self.use_vllm:
+            return sample_completions_batch_vllm(
+                vllm_engine=self._vllm_engine,
+                tokenizer=self.tokenizer,
+                envs=envs,
+                sampling_params=self._build_vllm_sampling_params(),
+            )
         model = cast(Any, self.model)
         return sample_completions_batch_hf(
             model=model,
@@ -302,6 +348,14 @@ class OnPolicyDistillationTrainer:
     def _sample_completions_batch_with_mask(
         self, envs: List[EnvBase]
     ) -> Tuple[torch.Tensor, List[str], List[int], List[int], torch.Tensor]:
+        if self.use_vllm:
+            return sample_completions_batch_vllm(
+                vllm_engine=self._vllm_engine,
+                tokenizer=self.tokenizer,
+                envs=envs,
+                sampling_params=self._build_vllm_sampling_params(),
+                return_attention_mask=True,
+            )
         model = cast(Any, self.model)
         return sample_completions_batch_hf(
             model=model,
@@ -510,9 +564,21 @@ class OnPolicyDistillationTrainer:
                     raise ValueError("Epoch sampling produced an empty batch.")
                 env_batch = [self.train_dataset[idx] for idx in batch_indices]
 
+            # Sync training weights to vLLM before generation (skip step 0 — synced in __init__).
+            if self.use_vllm and step > 0 and step != self._last_synced_step:
+                sync_model_weights_to_vllm(self.model, self._vllm_engine)
+                self._last_synced_step = step
+
+            if self.use_vllm and self.vllm_enable_sleep:
+                vllm_wake_up(self._vllm_engine)
+
             sequences, texts, _prompt_lens, completion_lens, input_attention_mask = (
                 self._sample_completions_batch_with_mask(env_batch)
             )
+
+            if self.use_vllm and self.vllm_enable_sleep:
+                vllm_sleep(self._vllm_engine)
+
             # _prompt_lens are true prompt lengths; input_length is the padded generation boundary.
             full_attention_mask = self._build_full_attention_mask(
                 input_attention_mask, completion_lens, sequences
