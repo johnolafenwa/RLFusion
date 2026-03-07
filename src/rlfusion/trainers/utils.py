@@ -86,6 +86,9 @@ def get_tokenizer_compat_kwargs(model_id_or_path: str) -> dict[str, Any]:
 
     Newer transformers versions expect `extra_special_tokens` as a dict. Some
     saved checkpoints store it as a plain list, which raises at tokenizer load.
+    Local Qwen2/Qwen3 checkpoints on current transformers also need
+    ``fix_mistral_regex=True`` to avoid a known regex regression when the
+    tokenizer is reloaded from disk.
     """
     model_path = Path(model_id_or_path)
     if not model_path.is_dir():
@@ -100,15 +103,20 @@ def get_tokenizer_compat_kwargs(model_id_or_path: str) -> dict[str, Any]:
     except Exception:
         return {}
 
+    compat_kwargs: dict[str, Any] = {}
     extra_special_tokens = tokenizer_config.get("extra_special_tokens")
-    if not isinstance(extra_special_tokens, list):
-        return {}
+    if isinstance(extra_special_tokens, list):
+        normalized_tokens: dict[str, str] = {}
+        for idx, token in enumerate(extra_special_tokens):
+            token_value = token if isinstance(token, str) else str(token)
+            normalized_tokens[f"extra_special_token_{idx}"] = token_value
+        compat_kwargs["extra_special_tokens"] = normalized_tokens
 
-    normalized_tokens: dict[str, str] = {}
-    for idx, token in enumerate(extra_special_tokens):
-        token_value = token if isinstance(token, str) else str(token)
-        normalized_tokens[f"extra_special_token_{idx}"] = token_value
-    return {"extra_special_tokens": normalized_tokens}
+    tokenizer_class = tokenizer_config.get("tokenizer_class")
+    if tokenizer_class in {"Qwen2Tokenizer", "Qwen2TokenizerFast"}:
+        compat_kwargs["fix_mistral_regex"] = True
+
+    return compat_kwargs
 
 
 def normalize_generation_args(generation_args: Optional[dict[str, Any]]) -> dict[str, Any]:

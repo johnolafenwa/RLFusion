@@ -265,8 +265,9 @@ Notes:
 - GRPO: `training_guide/grpo.md`
 - On-policy distillation: `training_guide/onpolicy_distillation.md`
 - Reasoning pipeline (dataset-specific): `examples/reasoning/README.md`
-- Qwen3 GRPO example on `johnolafenwa/reasoning-rl`: `examples/grpo_qwen3_4b_instruct_2507.py`
-- Qwen3 inference probe: `examples/qwen3_4b_instruct_2507_inference.py`
+- Qwen3 reasoning SFT on `johnolafenwa/reasoning-sft`: `examples/sft_qwen3_4b_instruct_2507_reasoning.py`
+- Qwen3 reasoning GRPO from that SFT checkpoint: `examples/grpo_qwen3_4b_instruct_2507.py`
+- Qwen3 base-model inference probe: `examples/qwen3_4b_instruct_2507_inference.py`
 
 ## Testing
 ```bash

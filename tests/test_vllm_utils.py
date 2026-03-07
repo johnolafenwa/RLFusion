@@ -57,7 +57,7 @@ class _FakeEngine:
 
 
 def test_sample_completions_batch_vllm_returns_full_attention_mask():
-    envs = [
+    envs: list[EnvBase] = [
         _DummyEnv(prompt=[{"role": "user", "content": "short"}], answer="x"),
         _DummyEnv(prompt=[{"role": "user", "content": "long"}], answer="y"),
     ]

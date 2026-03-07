@@ -1,7 +1,12 @@
-"""GRPO on johnolafenwa/reasoning-rl with Qwen/Qwen3-4B-Instruct-2507.
+"""GRPO on johnolafenwa/reasoning-rl after reasoning-format SFT.
 
-This model card describes Qwen3-4B-Instruct-2507 as a non-thinking model, so
-the reward uses boxed-answer exact match instead of requiring `<think>` tags.
+Expected answer format:
+  <think>...</think> \boxed{answer}
+
+This script assumes the model has first been SFT-tuned on
+`johnolafenwa/reasoning-sft`, which contains the required think-tag and boxed
+answer format. GRPO then reinforces correctness on `johnolafenwa/reasoning-rl`
+while preserving that output structure.
 """
 
 from __future__ import annotations
@@ -18,36 +23,55 @@ from rlfusion.envs import EnvBase
 from rlfusion.trainers.grpo_trainer import GRPOTrainer
 from rlfusion.utils import get_boxed_answer
 
-MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
-BOXED_INSTRUCTION = "Please reason step by step in at most three short steps, and put your final answer within \\boxed{}."
+DEFAULT_SFT_CHECKPOINT = "./outputs/qwen3_4b_instruct_2507_reasoning_sft/final"
 
 
 @dataclass
-class QwenReasoningEnv(EnvBase):
+class ReasoningRLEnv(EnvBase):
     def get_reward(self, prediction: str | None) -> float:
         if prediction is None or self.answer is None:
             return 0.0
 
-        boxed = get_boxed_answer(str(prediction))
+        text = str(prediction)
+        think_open = "<think>"
+        think_close = "</think>"
+
+        if not text.startswith(think_open):
+            return 0.0
+
+        close_idx = text.find(think_close)
+        if close_idx == -1:
+            return 0.0
+
+        think_content = text[len(think_open) : close_idx]
+        if not think_content.strip():
+            return 0.0
+
+        answer_text = text[close_idx + len(think_close) :]
+        if not answer_text.strip():
+            return 0.0
+
+        boxed = get_boxed_answer(answer_text)
         if boxed is None:
             return 0.0
+
         return 1.0 if boxed == str(self.answer) else 0.0
 
 
-class QwenReasoningRLDataset(Dataset):
-    """Adapter for johnolafenwa/reasoning-rl with a boxed-answer prompt."""
+class ReasoningRLDataset(Dataset):
+    """Adapter for johnolafenwa/reasoning-rl."""
 
     def __init__(
         self,
         split: str,
         max_samples: Optional[int] = None,
         seed: Optional[int] = None,
-    ):
+    ) -> None:
         try:
             from datasets import load_dataset
         except ImportError as exc:
             raise ImportError(
-                "datasets is required for QwenReasoningRLDataset. Install with: uv pip install datasets"
+                "datasets is required for ReasoningRLDataset. Install with: uv pip install datasets"
             ) from exc
 
         if split not in {"train", "test"}:
@@ -65,25 +89,30 @@ class QwenReasoningRLDataset(Dataset):
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, index: int) -> QwenReasoningEnv:
+    def __getitem__(self, index: int) -> ReasoningRLEnv:
         row = self.dataset[index]
         if row.get("problem") is None:
             raise ValueError("Dataset row missing required field: problem.")
         if row.get("answer") is None:
             raise ValueError("Dataset row missing required field: answer.")
 
-        prompt_text = f"{str(row['problem'])}\n\n{BOXED_INSTRUCTION}"
-        answer = str(row["answer"])
-        return QwenReasoningEnv(
-            prompt=[{"role": "user", "content": prompt_text}],
-            answer=answer,
+        return ReasoningRLEnv(
+            prompt=[{"role": "user", "content": str(row["problem"])}],
+            answer=str(row["answer"]),
         )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run GRPO training on reasoning-rl with Qwen3-4B-Instruct-2507.")
-    parser.add_argument("--model", type=str, default=MODEL_ID)
-    parser.add_argument("--output-dir", type=str, default="./outputs/grpo_qwen3_4b_instruct_2507")
+    parser = argparse.ArgumentParser(
+        description="Run GRPO on reasoning-rl from a Qwen3-4B reasoning-format SFT checkpoint."
+    )
+    parser.add_argument(
+        "--sft-checkpoint",
+        type=str,
+        default=DEFAULT_SFT_CHECKPOINT,
+        help="Path to the reasoning-format SFT checkpoint to use as the GRPO base.",
+    )
+    parser.add_argument("--output-dir", type=str, default="./outputs/qwen3_4b_instruct_2507_reasoning_grpo")
     parser.add_argument("--num-epochs", type=int, default=1)
     parser.add_argument("--num-steps", type=int, default=500)
     parser.add_argument("--saving-steps", type=int, default=50)
@@ -123,7 +152,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Use colocated vLLM generation. Defaults to enabled on CUDA and disabled otherwise.",
     )
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.3, help="vLLM GPU memory utilization (0-1).")
+    parser.add_argument(
+        "--vllm-gpu-memory-utilization",
+        type=float,
+        default=0.3,
+        help="vLLM GPU memory utilization (0-1).",
+    )
     parser.add_argument(
         "--vllm-tensor-parallel-size",
         type=int,
@@ -150,8 +184,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    train_dataset = QwenReasoningRLDataset(split="train", max_samples=args.train_max_samples, seed=args.seed)
-    eval_dataset = QwenReasoningRLDataset(split="test", max_samples=args.test_max_samples, seed=args.seed)
+    train_dataset = ReasoningRLDataset(split="train", max_samples=args.train_max_samples, seed=args.seed)
+    eval_dataset = ReasoningRLDataset(split="test", max_samples=args.test_max_samples, seed=args.seed)
 
     if args.num_epochs is not None:
         steps_for_checkpoint_interval = math.ceil(len(train_dataset) / args.batch_size) * args.num_epochs
@@ -168,7 +202,7 @@ def main() -> None:
     }
 
     trainer = GRPOTrainer(
-        model=args.model,
+        model=args.sft_checkpoint,
         train_dataset=train_dataset,
         num_steps=args.num_steps,
         num_epochs=args.num_epochs,

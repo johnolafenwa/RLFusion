@@ -14,9 +14,9 @@ authors = [
 ]
 dependencies = [
     "accelerate>=1.12.0",
-    "torch",
-    # Keep unpinned so uv can resolve the newest compatible Transformers release.
-    "transformers",
+    "torch>=2.10.0,<2.11",
+    # Pin to the latest vLLM-compatible transformers release we validated locally.
+    "transformers>=4.57.6,<4.58",
     "wandb",
     "datasets",
     "regex",
@@ -49,9 +49,6 @@ dev = [
     "ruff",
     "ty",
 ]
-
-[tool.uv]
-resolution = "highest"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
