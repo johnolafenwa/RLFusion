@@ -58,11 +58,21 @@ class MathDataset(Dataset):
         if operand not in operand_to_value:
             raise ValueError(f"Operand can only be one of {operand_to_value.keys()}")
 
+        valid_divisors = None
+        if operand == "division":
+            valid_divisors = [value for value in range(min_val, max_val + 1) if value != 0]
+            if not valid_divisors:
+                raise ValueError("Division requires at least one non-zero denominator in range.")
+
         self.dataset = []
 
         for i in range(num_samples):
             a = random.randint(min_val, max_val)
-            b = random.randint(min_val, max_val)
+            if operand == "division":
+                assert valid_divisors is not None
+                b = random.choice(valid_divisors)
+            else:
+                b = random.randint(min_val, max_val)
 
             operand_values = operand_to_value[operand]
             operand_value = operand_values.symbol
@@ -89,4 +99,3 @@ class MathDataset(Dataset):
     def __len__(self) -> int:
 
         return len(self.dataset)
-

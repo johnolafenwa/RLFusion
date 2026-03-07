@@ -85,6 +85,16 @@ def get_tokenizer_compat_kwargs(model_id_or_path: str) -> dict[str, Any]:
     return {"extra_special_tokens": normalized_tokens}
 
 
+def normalize_generation_args(generation_args: Optional[dict[str, Any]]) -> dict[str, Any]:
+    normalized = {} if generation_args is None else dict(generation_args)
+    if "temperature" in normalized:
+        raise ValueError(
+            "Use sampling_temperature (and eval_temperature for trainer.test) instead of "
+            "generation_args['temperature']."
+        )
+    return normalized
+
+
 def truncate_text(text: Optional[str], max_chars: Optional[int]) -> str:
     if text is None:
         return "<none>"
@@ -118,6 +128,10 @@ def build_full_attention_mask(
     if input_attention_mask.shape[1] > sequence_ids.shape[1]:
         raise ValueError("input_attention_mask exceeds sequence length.")
 
+    # Some generation backends already return a full-sequence attention mask.
+    if input_attention_mask.shape == sequence_ids.shape:
+        return input_attention_mask.to(sequence_ids.device).long()
+
     # Preserve prompt padding holes while marking only generated tokens as attendable.
     input_attention_mask = input_attention_mask.to(sequence_ids.device)
     full_mask = torch.zeros_like(sequence_ids, dtype=torch.long)
@@ -130,3 +144,50 @@ def build_full_attention_mask(
             full_mask[idx, input_len:end] = 1
 
     return full_mask
+
+
+def build_completion_mask_from_attention(
+    full_attention_mask: AttentionMask,
+    completion_lengths: Sequence[int],
+    sequence_ids: TokenIds,
+    *,
+    keep_first_token_when_zero: bool = False,
+) -> AttentionMask:
+    if full_attention_mask.ndim == 1:
+        full_attention_mask = full_attention_mask.unsqueeze(0)
+    if full_attention_mask.shape != sequence_ids.shape:
+        raise ValueError("full_attention_mask must match sequence_ids shape.")
+    if len(completion_lengths) != sequence_ids.shape[0]:
+        raise ValueError("completion_lengths must match batch size.")
+
+    full_attention_mask = full_attention_mask.to(sequence_ids.device).long()
+    seq_len = sequence_ids.shape[1]
+    if seq_len <= 1:
+        return torch.zeros((sequence_ids.shape[0], 0), device=sequence_ids.device, dtype=torch.float32)
+
+    batch_masks = torch.zeros(
+        (sequence_ids.shape[0], seq_len - 1),
+        device=sequence_ids.device,
+        dtype=torch.float32,
+    )
+
+    for idx, completion_len in enumerate(completion_lengths):
+        attended_positions = full_attention_mask[idx].nonzero(as_tuple=False).flatten()
+        if attended_positions.numel() == 0:
+            continue
+
+        last_attended = int(attended_positions[-1].item())
+        completion_len = int(completion_len)
+
+        if completion_len <= 0:
+            if keep_first_token_when_zero and last_attended < seq_len - 1:
+                batch_masks[idx, last_attended] = 1.0
+            continue
+
+        first_completion_token = max(last_attended - completion_len + 1, 0)
+        start = max(first_completion_token - 1, 0)
+        end = min(last_attended, seq_len - 1)
+        if end > start:
+            batch_masks[idx, start:end] = 1.0
+
+    return batch_masks

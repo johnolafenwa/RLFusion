@@ -13,6 +13,11 @@ class DummyEnv(EnvBase):
         return 1.0 if prediction == "completion" else 0.0
 
 
+class NonFiniteRewardEnv(EnvBase):
+    def get_reward(self, prediction: str) -> float:
+        return float("nan")
+
+
 class FakeTokenizer:
     pad_token_id = 0
     eos_token_id = 1
@@ -183,3 +188,23 @@ def test_evaluator_vllm_engine_uses_generation_outputs(monkeypatch):
     assert texts == ["completion"]
     assert prompt_lengths == [2]
     assert completion_lengths == [1]
+
+
+def test_evaluator_sanitizes_non_finite_rewards(tmp_path, monkeypatch):
+    dataset = [NonFiniteRewardEnv(prompt=[{"role": "user", "content": "Hi"}])]
+
+    monkeypatch.setattr("rlfusion.evaluation.evaluator.AutoModelForCausalLM", FakeAutoModelForCausalLM)
+    monkeypatch.setattr("rlfusion.evaluation.evaluator.AutoTokenizer", FakeAutoTokenizer)
+
+    evaluator = Evaluator(
+        model="fake",
+        dataset=dataset,
+        output_dir=str(tmp_path),
+        batch_size=1,
+        max_new_tokens=2,
+    )
+
+    metrics = evaluator.evaluate()
+
+    assert metrics["reward_mean"] == 0.0
+    assert metrics["reward_std"] == 0.0

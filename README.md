@@ -191,7 +191,9 @@ trainer.train()
 
 Notes:
 - For reward metrics, `eval_dataset` environments should implement `get_reward`, and samples should have `answer` populated.
-- In `trainer.test(...)`, `num_batches` must be `>= 1` when set, and `eval_temperature` must be `> 0` when set.
+- In `trainer.test(...)`, `num_batches` must be `>= 1` when set.
+- In `GRPOTrainer.test(...)` and `OnPolicyDistillationTrainer.test(...)`, `eval_temperature` must be `> 0` when set.
+- Do not pass `temperature` via `generation_args`; use `sampling_temperature` during training/evaluation, and `eval_temperature` for RL trainer eval overrides.
 
 ## Training Guides
 - SFT: `training_guide/sft.md`

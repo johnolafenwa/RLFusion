@@ -1,6 +1,9 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from rlfusion.envs import EnvBase
 from rlfusion.trainers.sft_trainer import SFTTrainer
 
 
@@ -41,6 +44,22 @@ class DummyTokenizer:
             "input_ids": torch.tensor(padded_ids, dtype=torch.long),
             "attention_mask": torch.tensor(padded_mask, dtype=torch.long),
         }
+
+
+class DummyRewardEnv(EnvBase):
+    def get_reward(self, prediction: str) -> float:
+        return float("nan")
+
+
+class DummyEvalModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        _ = (attention_mask, labels)
+        loss = input_ids.sum().float() * 0.0 + self.weight * 0.0
+        return SimpleNamespace(loss=loss)
 
 
 def _make_trainer(mask_prompt=True):
@@ -189,6 +208,42 @@ def test_sft_returns_empty_batch_when_all_samples_dropped(caplog):
     assert "Dropped 1/1 sample(s)" in caplog.text
 
 
+def test_sft_compute_reward_returns_none_for_non_finite_values():
+    trainer = SFTTrainer.__new__(SFTTrainer)
+    env = DummyRewardEnv(prompt=[{"role": "user", "content": "q"}], answer=None)
+
+    assert trainer._compute_reward(env, "text") is None
+
+
+def test_sft_test_restores_model_mode():
+    trainer = SFTTrainer.__new__(SFTTrainer)
+    trainer.batch_size = 1
+    trainer.eval_sample_completions = False
+    trainer._wandb = None
+    trainer.model = DummyEvalModel()
+    trainer.model.eval()
+
+    def _extract_sample(sample):
+        _ = sample
+        return [{"role": "user", "content": "q"}], "a"
+
+    def _build_batch(prompts, responses, mask_prompt=True):
+        _ = (prompts, responses, mask_prompt)
+        return (
+            torch.tensor([[1, 2]], dtype=torch.long),
+            torch.tensor([[1, 1]], dtype=torch.long),
+            torch.tensor([[-100, 2]], dtype=torch.long),
+        )
+
+    trainer._extract_sample = _extract_sample
+    trainer._build_batch = _build_batch
+
+    dataset = [DummyRewardEnv(prompt=[{"role": "user", "content": "q"}], answer="a")]
+    trainer.test(dataset=dataset, num_batches=1)
+
+    assert trainer.model.training is False
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -260,3 +315,10 @@ def test_sft_validate_init_args_rejects_invalid_max_seq_len():
             eval_steps=None,
             max_seq_len=0,
         )
+
+
+def test_sft_test_rejects_non_positive_num_batches():
+    trainer = SFTTrainer.__new__(SFTTrainer)
+
+    with pytest.raises(ValueError, match="num_batches must be >= 1 or None."):
+        trainer.test(dataset=[{"prompt": [], "answer": None}], num_batches=0)

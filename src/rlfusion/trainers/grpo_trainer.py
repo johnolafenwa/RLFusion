@@ -43,6 +43,8 @@ from rlfusion.trainers.utils import (
     resolve_attention_implementation,
     get_tokenizer_compat_kwargs,
     build_full_attention_mask,
+    build_completion_mask_from_attention,
+    normalize_generation_args,
 )
 from rlfusion.trainers.common import configure_logging, is_main_process, unwrap_model_for_saving
 from rlfusion.envs import EnvBase
@@ -175,7 +177,7 @@ class GRPOTrainer():
         self.logging_steps = logging_steps
         self.max_new_tokens = max_new_tokens
         self.batch_size = batch_size
-        self.generation_args = generation_args or {}
+        self.generation_args = normalize_generation_args(generation_args)
         self.group_size = group_size
         self.ppo_steps = ppo_steps
         self.clip_eps = clip_eps
@@ -331,7 +333,7 @@ class GRPOTrainer():
             sync_model_weights_to_vllm(self.model, self._vllm_engine)
             logger.info("vLLM colocated engine initialized for generation.")
 
-        self._last_synced_step: int = 0
+        self._vllm_dirty = False
         self._num_steps: Optional[int] = None
 
 
@@ -354,14 +356,31 @@ class GRPOTrainer():
             temperature=self.sampling_temperature,
         )
 
+    def _prepare_vllm_for_generation(self) -> None:
+        if not self.use_vllm:
+            return
+        if self.vllm_enable_sleep:
+            vllm_wake_up(self._vllm_engine)
+        if self._vllm_dirty:
+            sync_model_weights_to_vllm(self.model, self._vllm_engine)
+            self._vllm_dirty = False
+
+    def _finish_vllm_generation(self) -> None:
+        if self.use_vllm and self.vllm_enable_sleep:
+            vllm_sleep(self._vllm_engine)
+
     def sample_completions_batch(self, envs: List[EnvBase]) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
         if self.use_vllm:
-            return sample_completions_batch_vllm(
-                vllm_engine=self._vllm_engine,
-                tokenizer=self.tokenizer,
-                envs=envs,
-                sampling_params=self._build_vllm_sampling_params(),
-            )
+            self._prepare_vllm_for_generation()
+            try:
+                return sample_completions_batch_vllm(
+                    vllm_engine=self._vllm_engine,
+                    tokenizer=self.tokenizer,
+                    envs=envs,
+                    sampling_params=self._build_vllm_sampling_params(),
+                )
+            finally:
+                self._finish_vllm_generation()
         model = cast(Any, self.model)
         return sample_completions_batch_hf(
             model=model,
@@ -377,13 +396,17 @@ class GRPOTrainer():
         self, envs: List[EnvBase]
     ) -> Tuple[torch.Tensor, List[str], List[int], List[int], torch.Tensor]:
         if self.use_vllm:
-            return sample_completions_batch_vllm(
-                vllm_engine=self._vllm_engine,
-                tokenizer=self.tokenizer,
-                envs=envs,
-                sampling_params=self._build_vllm_sampling_params(),
-                return_attention_mask=True,
-            )
+            self._prepare_vllm_for_generation()
+            try:
+                return sample_completions_batch_vllm(
+                    vllm_engine=self._vllm_engine,
+                    tokenizer=self.tokenizer,
+                    envs=envs,
+                    sampling_params=self._build_vllm_sampling_params(),
+                    return_attention_mask=True,
+                )
+            finally:
+                self._finish_vllm_generation()
         model = cast(Any, self.model)
         return sample_completions_batch_hf(
             model=model,
@@ -402,7 +425,10 @@ class GRPOTrainer():
         reward_value = env.get_reward(completion_text)
         if reward_value is None:
             return -(self.max_error + self.invalid_penalty)
-        return float(reward_value)
+        reward = float(reward_value)
+        if not math.isfinite(reward):
+            return -(self.max_error + self.invalid_penalty)
+        return reward
 
 
     def compute_advantage(
@@ -454,6 +480,8 @@ class GRPOTrainer():
             sequence_ids = sequence_ids.unsqueeze(0)
         if model is None:
             model = self.model
+        model_device = next(model.parameters()).device
+        sequence_ids = sequence_ids.to(model_device)
 
         if attention_mask is None:
             # Fall back to pad-based masking only when an explicit mask is unavailable.
@@ -466,7 +494,7 @@ class GRPOTrainer():
                 attention_mask = attention_mask.unsqueeze(0)
             if attention_mask.shape != sequence_ids.shape:
                 raise ValueError("attention_mask must match sequence_ids shape.")
-            attention_mask = attention_mask.to(sequence_ids.device).long()
+            attention_mask = attention_mask.to(model_device).long()
 
         outputs = model(
             input_ids=sequence_ids,
@@ -474,7 +502,7 @@ class GRPOTrainer():
             use_cache=False
         )
 
-        logits = outputs.logits / max(self.sampling_temperature, 1e-6)
+        logits = outputs.logits
         logp = F.log_softmax(logits[:, :-1, :], dim=-1)
         targets = sequence_ids[:, 1:]
 
@@ -521,11 +549,28 @@ class GRPOTrainer():
 
         return -(obj.sum(dim=1) / denom) + (kl_beta * (kl.sum(dim=1) / denom))
 
-    def generate_mask(self, trajectory: Trajectory, input_length: Optional[int] = None) -> torch.Tensor:
-        if trajectory.prompt_len is None and input_length is None:
-            raise ValueError("Trajectory prompt_len or input_length is required to build the mask.")
+    def generate_mask(
+        self,
+        trajectory: Trajectory,
+        input_length: Optional[int] = None,
+        full_attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if trajectory.sequence_ids is None:
             raise ValueError("Trajectory sequence_ids is required to build the mask.")
+
+        if full_attention_mask is not None:
+            if full_attention_mask.ndim == 1:
+                full_attention_mask = full_attention_mask.unsqueeze(0)
+            mask = build_completion_mask_from_attention(
+                full_attention_mask,
+                [0 if trajectory.completion_len is None else int(trajectory.completion_len)],
+                trajectory.sequence_ids.unsqueeze(0),
+            )[0]
+            trajectory.mask = mask
+            return mask
+
+        if trajectory.prompt_len is None and input_length is None:
+            raise ValueError("Trajectory prompt_len or input_length is required to build the mask.")
 
         sequence_length = int(trajectory.sequence_ids.numel())
         mask = torch.zeros((sequence_length - 1,), device=trajectory.sequence_ids.device, dtype=torch.float32)
@@ -670,22 +715,29 @@ class GRPOTrainer():
             for env in env_batch:
                 envs.extend([env for _ in range(self.group_size)])
 
-            # Sync training weights to vLLM before generation (skip step 0 — synced in __init__).
-            if self.use_vllm and step > 0 and step != self._last_synced_step:
-                sync_model_weights_to_vllm(self.model, self._vllm_engine)
-                self._last_synced_step = step
+            was_training = self.model.training
+            self.model.eval()
+            try:
+                sequences, texts, prompt_lens, completion_lens, input_attention_mask = (
+                    self._sample_completions_batch_with_mask(envs)
+                )
 
-            if self.use_vllm and self.vllm_enable_sleep:
-                vllm_wake_up(self._vllm_engine)
-
-            sequences, texts, prompt_lens, completion_lens, input_attention_mask = (
-                self._sample_completions_batch_with_mask(envs)
-            )
-
-            if self.use_vllm and self.vllm_enable_sleep:
-                vllm_sleep(self._vllm_engine)
-
-            # prompt_lens are true prompt lengths; input_length is the padded generation boundary.
+                model_device = next(self.model.parameters()).device
+                sequences = sequences.to(model_device)
+                full_attention_mask = self._build_full_attention_mask(
+                    input_attention_mask, completion_lens, sequences
+                )
+                with torch.no_grad():
+                    old_log_probs = self.get_log_probs(sequences, attention_mask=full_attention_mask)
+                    if self.ref_model is not None:
+                        ref_log_probs = self.get_log_probs(
+                            sequences, model=self.ref_model, attention_mask=full_attention_mask
+                        )
+                    else:
+                        ref_log_probs = torch.zeros_like(old_log_probs)
+            finally:
+                if was_training:
+                    self.model.train()
 
             trajectories = []
             for i, env_instance in enumerate(envs):
@@ -701,24 +753,10 @@ class GRPOTrainer():
 
             self.compute_advantage(trajectories, group_size=self.group_size)
 
-            input_length = int(input_attention_mask.shape[1])
-            # Build a full mask that keeps prompt padding holes but enables generated tokens.
-            full_attention_mask = self._build_full_attention_mask(
-                input_attention_mask, completion_lens, sequences
-            )
-            with torch.no_grad():
-                old_log_probs = self.get_log_probs(sequences, attention_mask=full_attention_mask)
-                if self.ref_model is not None:
-                    ref_log_probs = self.get_log_probs(
-                        sequences, model=self.ref_model, attention_mask=full_attention_mask
-                    )
-                else:
-                    ref_log_probs = torch.zeros_like(old_log_probs)
-
             for i, traj in enumerate(trajectories):
                 traj.old_log_probs = old_log_probs[i]
                 traj.ref_log_probs = ref_log_probs[i]
-                self.generate_mask(traj, input_length=input_length)
+                self.generate_mask(traj, full_attention_mask=full_attention_mask[i])
 
             masks = torch.stack([traj.mask for traj in trajectories]).to(sequences.device)
             advantages = torch.tensor(
@@ -753,6 +791,10 @@ class GRPOTrainer():
                 if self.max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
+                if self.use_vllm:
+                    self._vllm_dirty = True
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
 
                 if ppo_step == self.ppo_steps - 1:
                     ratio = torch.exp(new_log_probs.detach() - old_log_probs)
@@ -777,9 +819,6 @@ class GRPOTrainer():
                         "mask_tokens_mean": float(mask_counts.mean().item()),
                         "completion_tokens_mean": float(completion_lengths.mean().item()),
                     }
-
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step()
 
             log_env = env_batch[0] if env_batch else envs[0]
             self._log_step(step + 1, log_env, trajectories, batch_stats)
@@ -825,6 +864,8 @@ class GRPOTrainer():
             raise ValueError("dataset is required for testing.")
         if num_batches is not None and num_batches <= 0:
             raise ValueError("num_batches must be >= 1 or None.")
+        if eval_temperature is not None and eval_temperature <= 0:
+            raise ValueError("eval_temperature must be > 0 or None.")
         eval_dataset = dataset
         dataset_len = len(eval_dataset)
         if dataset_len == 0:
@@ -835,6 +876,7 @@ class GRPOTrainer():
         if eval_temperature is not None:
             self.sampling_temperature = eval_temperature
 
+        was_training = self.model.training
         self.model.eval()
 
         try:
@@ -901,4 +943,7 @@ class GRPOTrainer():
         finally:
             # Restore original temperature and model state
             self.sampling_temperature = original_temperature
-            self.model.train()
+            if was_training:
+                self.model.train()
+            else:
+                self.model.eval()

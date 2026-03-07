@@ -106,8 +106,9 @@ def sample_completions_batch_vllm(
 ) -> CompletionBatch | CompletionBatchWithMask:
     """Generate completions using a vLLM engine and return padded tensors matching the HF format.
 
-    The returned sequence tensors are left-padded so that ``get_log_probs()``,
-    ``build_full_attention_mask()``, and ``generate_mask()`` work unchanged.
+    The returned sequence tensors are left-padded to a common length. When
+    ``return_attention_mask=True``, the attention mask matches the full padded
+    sequence and marks only prompt plus valid completion tokens as attendable.
     """
     formatted_prompts = [
         tokenizer.apply_chat_template(
@@ -165,43 +166,26 @@ def sample_completions_batch_vllm(
     max_len = max(len(ids) for ids in all_token_ids) if all_token_ids else 0
 
     padded_sequences: list[list[int]] = []
-    attention_masks: list[list[int]] = []
-    # The input_attention_mask covers only the prompt portion (before generation).
-    # We need to track the padded prompt length for each sequence.
-    padded_prompt_lengths: list[int] = []
+    full_attention_masks: list[list[int]] = []
 
     for i, ids in enumerate(all_token_ids):
         pad_len = max_len - len(ids)
         padded_sequences.append([pad_token_id] * pad_len + ids)
-        attention_masks.append([0] * pad_len + [1] * len(ids))
-        padded_prompt_lengths.append(pad_len + prompt_lengths[i])
+        active_len = prompt_lengths[i] + completion_lengths[i]
+        inactive_generated_len = max(len(ids) - active_len, 0)
+        full_attention_masks.append(
+            ([0] * pad_len)
+            + ([1] * active_len)
+            + ([0] * inactive_generated_len)
+        )
 
     sequences = torch.tensor(padded_sequences, dtype=torch.long)
 
-    # Return padded prompt lengths so downstream code (generate_mask, get_log_probs)
-    # gets the correct generation boundary in the padded tensor.
-    # Note: prompt_lengths here are the *padded* prompt lengths (pad + true prompt).
-
     if return_attention_mask:
-        # Build input_attention_mask: covers only the prompt portion of the padded tensor.
-        # Shape: (batch, padded_prompt_len) where padded_prompt_len = max padded prompt length.
-        max_padded_prompt = max(padded_prompt_lengths) if padded_prompt_lengths else 0
-        input_mask_list: list[list[int]] = []
-        for i in range(len(envs)):
-            pad_len = max_len - len(all_token_ids[i])
-            # The input mask has length = max_padded_prompt
-            # First pad_len positions are 0 (padding), then prompt_lengths[i] positions are 1
-            mask = [0] * pad_len + [1] * prompt_lengths[i]
-            # Pad or truncate to max_padded_prompt
-            if len(mask) < max_padded_prompt:
-                mask = mask + [0] * (max_padded_prompt - len(mask))
-            else:
-                mask = mask[:max_padded_prompt]
-            input_mask_list.append(mask)
-        input_attention_mask = torch.tensor(input_mask_list, dtype=torch.long)
-        return sequences, ret_texts, padded_prompt_lengths, completion_lengths, input_attention_mask
+        full_attention_mask = torch.tensor(full_attention_masks, dtype=torch.long)
+        return sequences, ret_texts, prompt_lengths, completion_lengths, full_attention_mask
 
-    return sequences, ret_texts, padded_prompt_lengths, completion_lengths
+    return sequences, ret_texts, prompt_lengths, completion_lengths
 
 
 # ---------------------------------------------------------------------------

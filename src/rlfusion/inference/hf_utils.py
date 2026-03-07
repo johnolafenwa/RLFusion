@@ -85,7 +85,8 @@ def sample_completions_batch_hf(
         "pad_token_id": tokenizer.pad_token_id,
         "return_dict_in_generate": True,
         "output_scores": False,
-        "use_cache": False,
+        # Rollout generation is no-grad, so enable KV caching for speed.
+        "use_cache": True,
     }
     if do_sample:
         gen_kwargs["temperature"] = sampling_temperature
@@ -123,5 +124,11 @@ def sample_completions_batch_hf(
         completion_lengths.append(max(end_offset, 0))
 
     if return_attention_mask:
-        return generated_sequences, ret_texts, prompt_lengths, completion_lengths, attention_mask
+        full_attention_mask = torch.zeros_like(generated_sequences, dtype=torch.long)
+        full_attention_mask[:, :input_length] = attention_mask.long()
+        for idx, completion_len in enumerate(completion_lengths):
+            end = min(input_length + int(completion_len), generated_sequences.shape[1])
+            if end > input_length:
+                full_attention_mask[idx, input_length:end] = 1
+        return generated_sequences, ret_texts, prompt_lengths, completion_lengths, full_attention_mask
     return generated_sequences, ret_texts, prompt_lengths, completion_lengths

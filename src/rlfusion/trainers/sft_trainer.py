@@ -32,6 +32,7 @@ from rlfusion.trainers.utils import (
     configure_torch_backends,
     resolve_attention_implementation,
     get_tokenizer_compat_kwargs,
+    normalize_generation_args,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,7 +141,7 @@ class SFTTrainer:
         self.max_new_tokens = max_new_tokens
         self.do_sample = do_sample
         self.sampling_temperature = sampling_temperature
-        self.generation_args = generation_args or {}
+        self.generation_args = normalize_generation_args(generation_args)
 
         device = get_device()
         if device == "cuda":
@@ -297,7 +298,10 @@ class SFTTrainer:
         reward_value = env.get_reward(completion_text)
         if reward_value is None:
             return None
-        return float(reward_value)
+        reward = float(reward_value)
+        if not math.isfinite(reward):
+            return None
+        return reward
 
     def _extract_sample(self, sample: Any) -> Tuple[list[dict[str, object]], Optional[str]]:
         if isinstance(sample, dict):
@@ -583,11 +587,14 @@ class SFTTrainer:
     ) -> dict:
         if dataset is None:
             raise ValueError("dataset is required for testing.")
+        if num_batches is not None and num_batches <= 0:
+            raise ValueError("num_batches must be >= 1 or None.")
         eval_dataset = dataset
         dataset_len = len(eval_dataset)
         if dataset_len == 0:
             raise ValueError("Eval dataset is empty.")
 
+        was_training = self.model.training
         self.model.eval()
 
         try:
@@ -706,4 +713,7 @@ class SFTTrainer:
                 results["reward_std"] = reward_std
             return results
         finally:
-            self.model.train()
+            if was_training:
+                self.model.train()
+            else:
+                self.model.eval()

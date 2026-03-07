@@ -15,6 +15,12 @@ class NaNRewardEnv(EnvBase):
         return float("nan")
 
 
+class DummyModeModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+
 def test_onpolicy_reward_returns_none_without_answer():
     trainer = OnPolicyDistillationTrainer.__new__(OnPolicyDistillationTrainer)
     env = DummyEnv(prompt=[], answer=None)
@@ -37,6 +43,46 @@ def test_onpolicy_reward_returns_none_for_non_finite_values():
     trainer = OnPolicyDistillationTrainer.__new__(OnPolicyDistillationTrainer)
     env = NaNRewardEnv(prompt=[], answer="ok")
     assert trainer._compute_reward(env, "text") is None
+
+
+def test_onpolicy_test_restores_model_modes():
+    trainer = OnPolicyDistillationTrainer.__new__(OnPolicyDistillationTrainer)
+    trainer.batch_size = 1
+    trainer.log_completions = False
+    trainer.max_log_chars = 200
+    trainer.sampling_temperature = 1.0
+    trainer._wandb = None
+    trainer.model = DummyModeModel()
+    trainer.teacher_model = DummyModeModel()
+    trainer.model.eval()
+    trainer.teacher_model.train()
+
+    def _sample_completions_batch_with_mask(envs):
+        _ = envs
+        return (
+            torch.tensor([[5, 0]], dtype=torch.long),
+            ["ok"],
+            [1],
+            [1],
+            torch.tensor([[1, 1]], dtype=torch.long),
+        )
+
+    trainer._sample_completions_batch_with_mask = _sample_completions_batch_with_mask
+
+    def _get_log_probs(sequence_ids, model=None, attention_mask=None):
+        _ = (sequence_ids, attention_mask)
+        target_model = trainer.model if model is None else model
+        if target_model is trainer.teacher_model:
+            return torch.tensor([[0.1]], dtype=torch.float32)
+        return torch.tensor([[0.2]], dtype=torch.float32)
+
+    trainer.get_log_probs = _get_log_probs
+
+    dataset = [DummyEnv(prompt=[{"role": "user", "content": "q"}], answer="4")]
+    trainer.test(dataset=dataset, num_batches=1)
+
+    assert trainer.model.training is False
+    assert trainer.teacher_model.training is True
 
 
 def test_onpolicy_test_rejects_non_positive_num_batches():
@@ -63,6 +109,22 @@ def test_onpolicy_build_masks_keeps_first_token_when_completion_len_zero():
         prompt_lengths=[4],
         completion_lengths=[0],
         sequence_ids=sequence_ids,
+    )
+
+    expected = torch.tensor([[0.0, 0.0, 0.0, 1.0, 0.0]], dtype=torch.float32)
+    assert torch.equal(masks, expected)
+
+
+def test_onpolicy_build_masks_full_attention_keeps_first_token_when_completion_len_zero():
+    trainer = OnPolicyDistillationTrainer.__new__(OnPolicyDistillationTrainer)
+
+    sequence_ids = torch.zeros((1, 6), dtype=torch.long)
+    full_attention_mask = torch.tensor([[0, 1, 1, 1, 0, 0]], dtype=torch.long)
+    masks = trainer._build_masks(
+        prompt_lengths=[3],
+        completion_lengths=[0],
+        sequence_ids=sequence_ids,
+        full_attention_mask=full_attention_mask,
     )
 
     expected = torch.tensor([[0.0, 0.0, 0.0, 1.0, 0.0]], dtype=torch.float32)

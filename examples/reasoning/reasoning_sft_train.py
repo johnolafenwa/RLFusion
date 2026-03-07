@@ -6,7 +6,7 @@ import argparse
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 from torch.utils.data import Dataset
 

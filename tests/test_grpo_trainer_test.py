@@ -10,11 +10,21 @@ class DummyEnv(EnvBase):
         return 1.0 if prediction.strip() == "4" else 0.0
 
 
+class NaNRewardEnv(EnvBase):
+    def get_reward(self, prediction: str) -> float:
+        return float("nan")
+
+
 class DummyModel:
+    def __init__(self, training: bool = False) -> None:
+        self.training = training
+
     def eval(self) -> None:
+        self.training = False
         return None
 
     def train(self) -> None:
+        self.training = True
         return None
 
 
@@ -23,7 +33,7 @@ def test_grpo_test_reports_reward_and_tokens():
     trainer.batch_size = 2
     trainer.log_completions = False
     trainer.max_log_chars = 200
-    trainer.model = DummyModel()
+    trainer.model = DummyModel(training=False)
     trainer.max_error = 1.0
     trainer.invalid_penalty = 1.0
     trainer.sampling_temperature = 1.0
@@ -46,6 +56,31 @@ def test_grpo_test_reports_reward_and_tokens():
     assert results["reward_mean"] == 0.5
     assert results["reward_std"] == 0.5
     assert results["completion_tokens_mean"] == 1.0
+    assert trainer.model.training is False
+
+
+def test_grpo_test_restores_training_mode():
+    trainer = GRPOTrainer.__new__(GRPOTrainer)
+    trainer.batch_size = 1
+    trainer.log_completions = False
+    trainer.max_log_chars = 200
+    trainer.model = DummyModel(training=True)
+    trainer.max_error = 1.0
+    trainer.invalid_penalty = 1.0
+    trainer.sampling_temperature = 1.0
+    trainer._wandb = None
+
+    def _sample_completions_batch(envs):
+        _ = envs
+        return None, ["4"], [0], [1]
+
+    trainer.sample_completions_batch = _sample_completions_batch
+
+    dataset = [DummyEnv(prompt=[{"role": "user", "content": "2 + 2?"}], answer="4")]
+
+    trainer.test(dataset=dataset, num_batches=1)
+
+    assert trainer.model.training is True
 
 
 def test_grpo_test_rejects_non_positive_num_batches():
@@ -62,6 +97,22 @@ def test_grpo_test_rejects_non_positive_num_batches():
     dataset = [DummyEnv(prompt=[{"role": "user", "content": "q"}], answer="4")]
     with pytest.raises(ValueError, match="num_batches must be >= 1 or None."):
         trainer.test(dataset=dataset, num_batches=0)
+
+
+def test_grpo_test_rejects_non_positive_eval_temperature():
+    trainer = GRPOTrainer.__new__(GRPOTrainer)
+    trainer.batch_size = 1
+    trainer.log_completions = False
+    trainer.max_log_chars = 200
+    trainer.model = DummyModel()
+    trainer.max_error = 1.0
+    trainer.invalid_penalty = 1.0
+    trainer.sampling_temperature = 1.0
+    trainer._wandb = None
+
+    dataset = [DummyEnv(prompt=[{"role": "user", "content": "q"}], answer="4")]
+    with pytest.raises(ValueError, match="eval_temperature must be > 0 or None."):
+        trainer.test(dataset=dataset, eval_temperature=0.0)
 
 
 def test_grpo_advantage_normalizes_within_group():
@@ -89,6 +140,15 @@ def test_grpo_compute_reward_does_not_require_answer():
 
     env = DummyEnv(prompt=[{"role": "user", "content": "q"}], answer=None)
     assert trainer._compute_reward(env, "4") == 1.0
+
+
+def test_grpo_compute_reward_rejects_non_finite_values():
+    trainer = GRPOTrainer.__new__(GRPOTrainer)
+    trainer.max_error = 100.0
+    trainer.invalid_penalty = 1.0
+
+    env = NaNRewardEnv(prompt=[{"role": "user", "content": "q"}], answer="4")
+    assert trainer._compute_reward(env, "text") == -101.0
 
 
 @pytest.mark.parametrize(

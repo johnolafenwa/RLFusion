@@ -43,6 +43,8 @@ from rlfusion.trainers.utils import (
     resolve_attention_implementation,
     get_tokenizer_compat_kwargs,
     build_full_attention_mask,
+    build_completion_mask_from_attention,
+    normalize_generation_args,
 )
 from rlfusion.trainers.common import configure_logging, is_main_process, unwrap_model_for_saving
 
@@ -168,7 +170,7 @@ class OnPolicyDistillationTrainer:
         self.output_dir = Path(output_dir)
         self.max_new_tokens = max_new_tokens
         self.batch_size = batch_size
-        self.generation_args = generation_args or {}
+        self.generation_args = normalize_generation_args(generation_args)
         self.ppo_steps = ppo_steps
         self.clip_eps = clip_eps
         self.log_completions = log_completions
@@ -219,6 +221,7 @@ class OnPolicyDistillationTrainer:
         if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "right"
+        self._validate_teacher_tokenizer_compatibility(teacher_model)
 
         self._wandb = None
         if enable_wandb and self._is_main_process():
@@ -295,7 +298,7 @@ class OnPolicyDistillationTrainer:
             sync_model_weights_to_vllm(self.model, self._vllm_engine)
             logger.info("vLLM colocated engine initialized for generation.")
 
-        self._last_synced_step: int = 0
+        self._vllm_dirty = False
         self._num_steps: Optional[int] = None
         if self.num_epochs is None:
             self._num_steps = self.num_steps
@@ -314,6 +317,34 @@ class OnPolicyDistillationTrainer:
     def _unwrap_model_for_saving(self) -> torch.nn.Module:
         return unwrap_model_for_saving(self.model, self.accelerator)
 
+    def _validate_teacher_tokenizer_compatibility(self, teacher_model: str) -> None:
+        teacher_kwargs = get_tokenizer_compat_kwargs(teacher_model)
+        teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model, **teacher_kwargs)
+        if teacher_tokenizer.pad_token_id is None and teacher_tokenizer.eos_token_id is not None:
+            teacher_tokenizer.pad_token = teacher_tokenizer.eos_token
+
+        def _special_ids(tokenizer: Any) -> tuple[Any, Any, Any, Any]:
+            return (
+                getattr(tokenizer, "pad_token_id", None),
+                getattr(tokenizer, "eos_token_id", None),
+                getattr(tokenizer, "bos_token_id", None),
+                getattr(tokenizer, "unk_token_id", None),
+            )
+
+        if len(self.tokenizer) != len(teacher_tokenizer):
+            raise ValueError("teacher_model tokenizer vocabulary must match the student tokenizer.")
+        if _special_ids(self.tokenizer) != _special_ids(teacher_tokenizer):
+            raise ValueError("teacher_model tokenizer special token IDs must match the student tokenizer.")
+
+        sentinel_texts = ["hello", "1 + 1 = 2", "\n", "A"]
+        for text in sentinel_texts:
+            student_ids = self.tokenizer.encode(text, add_special_tokens=False)
+            teacher_ids = teacher_tokenizer.encode(text, add_special_tokens=False)
+            if student_ids != teacher_ids:
+                raise ValueError(
+                    "teacher_model tokenizer must produce the same token IDs as the student tokenizer."
+                )
+
     def _build_vllm_sampling_params(self) -> Any:
         return build_sampling_params(
             self._vllm_sampling_params_cls,
@@ -324,16 +355,33 @@ class OnPolicyDistillationTrainer:
             temperature=self.sampling_temperature,
         )
 
+    def _prepare_vllm_for_generation(self) -> None:
+        if not self.use_vllm:
+            return
+        if self.vllm_enable_sleep:
+            vllm_wake_up(self._vllm_engine)
+        if self._vllm_dirty:
+            sync_model_weights_to_vllm(self.model, self._vllm_engine)
+            self._vllm_dirty = False
+
+    def _finish_vllm_generation(self) -> None:
+        if self.use_vllm and self.vllm_enable_sleep:
+            vllm_sleep(self._vllm_engine)
+
     def sample_completions_batch(
         self, envs: List[EnvBase]
     ) -> Tuple[torch.Tensor, List[str], List[int], List[int]]:
         if self.use_vllm:
-            return sample_completions_batch_vllm(
-                vllm_engine=self._vllm_engine,
-                tokenizer=self.tokenizer,
-                envs=envs,
-                sampling_params=self._build_vllm_sampling_params(),
-            )
+            self._prepare_vllm_for_generation()
+            try:
+                return sample_completions_batch_vllm(
+                    vllm_engine=self._vllm_engine,
+                    tokenizer=self.tokenizer,
+                    envs=envs,
+                    sampling_params=self._build_vllm_sampling_params(),
+                )
+            finally:
+                self._finish_vllm_generation()
         model = cast(Any, self.model)
         return sample_completions_batch_hf(
             model=model,
@@ -349,13 +397,17 @@ class OnPolicyDistillationTrainer:
         self, envs: List[EnvBase]
     ) -> Tuple[torch.Tensor, List[str], List[int], List[int], torch.Tensor]:
         if self.use_vllm:
-            return sample_completions_batch_vllm(
-                vllm_engine=self._vllm_engine,
-                tokenizer=self.tokenizer,
-                envs=envs,
-                sampling_params=self._build_vllm_sampling_params(),
-                return_attention_mask=True,
-            )
+            self._prepare_vllm_for_generation()
+            try:
+                return sample_completions_batch_vllm(
+                    vllm_engine=self._vllm_engine,
+                    tokenizer=self.tokenizer,
+                    envs=envs,
+                    sampling_params=self._build_vllm_sampling_params(),
+                    return_attention_mask=True,
+                )
+            finally:
+                self._finish_vllm_generation()
         model = cast(Any, self.model)
         return sample_completions_batch_hf(
             model=model,
@@ -386,6 +438,8 @@ class OnPolicyDistillationTrainer:
             sequence_ids = sequence_ids.unsqueeze(0)
         if model is None:
             model = self.model
+        model_device = next(model.parameters()).device
+        sequence_ids = sequence_ids.to(model_device)
 
         if attention_mask is None:
             # Fall back to pad-based masking only when an explicit mask is unavailable.
@@ -398,7 +452,7 @@ class OnPolicyDistillationTrainer:
                 attention_mask = attention_mask.unsqueeze(0)
             if attention_mask.shape != sequence_ids.shape:
                 raise ValueError("attention_mask must match sequence_ids shape.")
-            attention_mask = attention_mask.to(sequence_ids.device).long()
+            attention_mask = attention_mask.to(model_device).long()
 
         outputs = model(
             input_ids=sequence_ids,
@@ -406,7 +460,7 @@ class OnPolicyDistillationTrainer:
             use_cache=False,
         )
 
-        logits = outputs.logits / max(self.sampling_temperature, 1e-6)
+        logits = outputs.logits
         logp = F.log_softmax(logits[:, :-1, :], dim=-1)
         targets = sequence_ids[:, 1:]
 
@@ -417,7 +471,16 @@ class OnPolicyDistillationTrainer:
         prompt_lengths: List[int],
         completion_lengths: List[int],
         sequence_ids: torch.Tensor,
+        full_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if full_attention_mask is not None:
+            return build_completion_mask_from_attention(
+                full_attention_mask,
+                completion_lengths,
+                sequence_ids,
+                keep_first_token_when_zero=True,
+            )
+
         sequence_lengths = [int(seq.numel()) for seq in sequence_ids]
         masks = []
         for prompt_len, completion_len, seq_len in zip(prompt_lengths, completion_lengths, sequence_lengths):
@@ -564,34 +627,33 @@ class OnPolicyDistillationTrainer:
                     raise ValueError("Epoch sampling produced an empty batch.")
                 env_batch = [self.train_dataset[idx] for idx in batch_indices]
 
-            # Sync training weights to vLLM before generation (skip step 0 — synced in __init__).
-            if self.use_vllm and step > 0 and step != self._last_synced_step:
-                sync_model_weights_to_vllm(self.model, self._vllm_engine)
-                self._last_synced_step = step
-
-            if self.use_vllm and self.vllm_enable_sleep:
-                vllm_wake_up(self._vllm_engine)
-
-            sequences, texts, _prompt_lens, completion_lens, input_attention_mask = (
-                self._sample_completions_batch_with_mask(env_batch)
-            )
-
-            if self.use_vllm and self.vllm_enable_sleep:
-                vllm_sleep(self._vllm_engine)
-
-            # _prompt_lens are true prompt lengths; input_length is the padded generation boundary.
-            full_attention_mask = self._build_full_attention_mask(
-                input_attention_mask, completion_lens, sequences
-            )
-            with torch.no_grad():
-                old_log_probs = self.get_log_probs(sequences, attention_mask=full_attention_mask)
-                teacher_log_probs = self.get_log_probs(
-                    sequences, model=self.teacher_model, attention_mask=full_attention_mask
+            was_training = self.model.training
+            self.model.eval()
+            try:
+                sequences, texts, prompt_lens, completion_lens, input_attention_mask = (
+                    self._sample_completions_batch_with_mask(env_batch)
                 )
 
-            input_length = int(input_attention_mask.shape[1])
-            mask_prompt_lens = [input_length] * len(completion_lens)
-            masks = self._build_masks(mask_prompt_lens, completion_lens, sequences)
+                model_device = next(self.model.parameters()).device
+                sequences = sequences.to(model_device)
+                full_attention_mask = self._build_full_attention_mask(
+                    input_attention_mask, completion_lens, sequences
+                )
+                with torch.no_grad():
+                    old_log_probs = self.get_log_probs(sequences, attention_mask=full_attention_mask)
+                    teacher_log_probs = self.get_log_probs(
+                        sequences, model=self.teacher_model, attention_mask=full_attention_mask
+                    )
+            finally:
+                if was_training:
+                    self.model.train()
+
+            masks = self._build_masks(
+                prompt_lens,
+                completion_lens,
+                sequences,
+                full_attention_mask=full_attention_mask,
+            )
             mask_counts = masks.sum(dim=1).clamp_min(1.0)
             reverse_kl = (old_log_probs - teacher_log_probs) * masks
             # Use negative reverse KL as an advantage signal to pull toward the teacher.
@@ -616,9 +678,10 @@ class OnPolicyDistillationTrainer:
                 if self.max_grad_norm is not None:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                 self.optimizer.step()
-
-            if self.lr_scheduler is not None:
-                self.lr_scheduler.step()
+                if self.use_vllm:
+                    self._vllm_dirty = True
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
 
             reverse_kl_mean = float((reverse_kl.sum(dim=1) / mask_counts).mean().item())
 
@@ -701,6 +764,8 @@ class OnPolicyDistillationTrainer:
         if eval_temperature is not None:
             self.sampling_temperature = eval_temperature
 
+        student_was_training = self.model.training
+        teacher_was_training = self.teacher_model.training
         self.model.eval()
         self.teacher_model.eval()
 
@@ -725,7 +790,8 @@ class OnPolicyDistillationTrainer:
                     sequences, texts, _prompt_lens, completion_lens, input_attention_mask = (
                         self._sample_completions_batch_with_mask(env_batch)
                     )
-                    # _prompt_lens are true prompt lengths; input_length is the padded generation boundary.
+                    model_device = next(self.model.parameters()).device
+                    sequences = sequences.to(model_device)
                     full_attention_mask = self._build_full_attention_mask(
                         input_attention_mask, completion_lens, sequences
                     )
@@ -736,9 +802,12 @@ class OnPolicyDistillationTrainer:
                         sequences, model=self.teacher_model, attention_mask=full_attention_mask
                     )
 
-                input_length = int(input_attention_mask.shape[1])
-                mask_prompt_lens = [input_length] * len(completion_lens)
-                masks = self._build_masks(mask_prompt_lens, completion_lens, sequences)
+                masks = self._build_masks(
+                    _prompt_lens,
+                    completion_lens,
+                    sequences,
+                    full_attention_mask=full_attention_mask,
+                )
                 mask_counts = masks.sum(dim=1).clamp_min(1.0)
                 reverse_kl = (student_log_probs - teacher_log_probs) * masks
                 loss_per = reverse_kl.sum(dim=1) / mask_counts
@@ -823,4 +892,11 @@ class OnPolicyDistillationTrainer:
         finally:
             # Restore original temperature and model state
             self.sampling_temperature = original_temperature
-            self.model.train()
+            if student_was_training:
+                self.model.train()
+            else:
+                self.model.eval()
+            if teacher_was_training:
+                self.teacher_model.train()
+            else:
+                self.teacher_model.eval()

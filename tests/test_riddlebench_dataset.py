@@ -44,8 +44,10 @@ def test_riddlebench_dataset_builds_prompt(monkeypatch) -> None:
     assert captured["split"] == "train"
     assert isinstance(sample, EnvBase)
     assert sample.prompt[0]["role"] == "system"
+    assert isinstance(sample.prompt[0]["content"], str)
     assert "\\boxed" in sample.prompt[0]["content"]
     assert sample.prompt[1]["role"] == "user"
+    assert isinstance(sample.prompt[1]["content"], str)
     assert sample.prompt[1]["content"].startswith("1, 2, ?, 4")
     assert "\\boxed" in sample.prompt[1]["content"]
     assert sample.answer == "3"
@@ -72,6 +74,7 @@ def test_riddlebench_dataset_filters_task_types_and_eval_split(monkeypatch) -> N
     )
 
     assert len(dataset) == 1
+    assert isinstance(dataset[0].prompt[1]["content"], str)
     assert dataset[0].prompt[1]["content"].startswith("q3")
 
 

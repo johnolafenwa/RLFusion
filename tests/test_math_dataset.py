@@ -39,3 +39,20 @@ def test_math_dataset_samples_match_expected(operand, symbol, fn):
 def test_math_dataset_invalid_operand_raises():
     with pytest.raises(ValueError):
         MathDataset(operand="pow")
+
+
+def test_math_dataset_division_requires_non_zero_denominator_range():
+    with pytest.raises(ValueError, match="non-zero denominator"):
+        MathDataset(num_samples=1, min_val=0, max_val=0, operand="division")
+
+
+def test_math_dataset_division_avoids_zero_denominators():
+    random.seed(123)
+    dataset = MathDataset(num_samples=10, min_val=-1, max_val=1, operand="division")
+
+    for idx in range(len(dataset)):
+        sample = dataset[idx]
+        user_prompt = sample.prompt[1]["content"]
+        assert isinstance(user_prompt, str)
+        assert user_prompt != "What is 0 / 0 ?"
+        assert not user_prompt.endswith("/ 0 ?")

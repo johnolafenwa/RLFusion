@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import importlib
 import json
 import logging
@@ -30,6 +31,7 @@ from rlfusion.trainers.utils import (
     format_prompt,
     get_device,
     get_tokenizer_compat_kwargs,
+    normalize_generation_args,
     resolve_attention_implementation,
     set_seed,
     truncate_text,
@@ -74,7 +76,7 @@ class Evaluator:
         self.dataset = dataset
         self.batch_size = batch_size
         self.max_new_tokens = max_new_tokens
-        self.generation_args = generation_args or {}
+        self.generation_args = normalize_generation_args(generation_args)
         self.do_sample = do_sample
         self.sampling_temperature = sampling_temperature
         self.log_completions = log_completions
@@ -184,7 +186,10 @@ class Evaluator:
         if completion_text is None:
             return 0.0
         reward_value = env.get_reward(completion_text)
-        return 0.0 if reward_value is None else float(reward_value)
+        if reward_value is None:
+            return 0.0
+        reward = float(reward_value)
+        return reward if math.isfinite(reward) else 0.0
 
     def _build_vllm_sampling_params(self) -> Any:
         if self._vllm_sampling_params_cls is None:

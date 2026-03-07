@@ -40,11 +40,13 @@ class _DummyGenerateOutput:
 class _DummyModel:
     def __init__(self) -> None:
         self._param = torch.nn.Parameter(torch.zeros(1))
+        self.last_generate_kwargs = None
 
     def parameters(self):
         return iter([self._param])
 
     def generate(self, **kwargs):
+        self.last_generate_kwargs = kwargs
         input_ids = kwargs["input_ids"]
         batch_size = input_ids.shape[0]
         completions = torch.full((batch_size, 2), 7, dtype=input_ids.dtype, device=input_ids.device)
@@ -80,3 +82,54 @@ def test_sample_completions_batch_hf_uses_left_padding_and_restores_tokenizer():
     assert texts == ["decoded", "decoded"]
     assert prompt_lengths == [2, 3]
     assert completion_lengths == [2, 2]
+
+
+def test_sample_completions_batch_hf_returns_full_attention_mask():
+    tokenizer = _DummyTokenizer()
+    model = _DummyModel()
+    envs = [
+        _DummyEnv(prompt=[{"role": "user", "content": "short"}], answer="x"),
+        _DummyEnv(prompt=[{"role": "user", "content": "longer prompt"}], answer="y"),
+    ]
+
+    sequences, _, _, _, attention_mask = sample_completions_batch_hf(
+        model=model,
+        tokenizer=tokenizer,
+        envs=envs,
+        do_sample=True,
+        sampling_temperature=1.0,
+        max_new_tokens=2,
+        generation_args={},
+        return_attention_mask=True,
+    )
+
+    assert tuple(sequences.shape) == (2, 5)
+    expected = torch.tensor(
+        [
+            [0, 1, 1, 1, 1],
+            [1, 1, 1, 1, 1],
+        ],
+        dtype=torch.long,
+    )
+    assert torch.equal(attention_mask, expected)
+
+
+def test_sample_completions_batch_hf_allows_generation_temperature_override():
+    tokenizer = _DummyTokenizer()
+    model = _DummyModel()
+    envs = [_DummyEnv(prompt=[{"role": "user", "content": "short"}], answer="x")]
+
+    sample_completions_batch_hf(
+        model=model,
+        tokenizer=tokenizer,
+        envs=envs,
+        do_sample=True,
+        sampling_temperature=0.8,
+        max_new_tokens=2,
+        generation_args={"temperature": 0.3},
+        return_attention_mask=False,
+    )
+
+    assert model.last_generate_kwargs is not None
+    assert model.last_generate_kwargs["temperature"] == 0.3
+    assert model.last_generate_kwargs["use_cache"] is True
