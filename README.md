@@ -265,6 +265,8 @@ Notes:
 - GRPO: `training_guide/grpo.md`
 - On-policy distillation: `training_guide/onpolicy_distillation.md`
 - Reasoning pipeline (dataset-specific): `examples/reasoning/README.md`
+- Qwen3 GRPO example on `johnolafenwa/reasoning-rl`: `examples/grpo_qwen3_4b_instruct_2507.py`
+- Qwen3 inference probe: `examples/qwen3_4b_instruct_2507_inference.py`
 
 ## Testing
 ```bash

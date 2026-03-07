@@ -3,6 +3,7 @@ import os
 import pytest
 import torch
 
+import rlfusion.inference.vllm_utils as vllm_utils
 from rlfusion.envs import EnvBase
 from rlfusion.inference.vllm_utils import (
     ensure_vllm_env,
@@ -182,6 +183,13 @@ class _TinyModel(torch.nn.Module):
         self.proj = torch.nn.Linear(2, 2, bias=False)
 
 
+class _TwoParamModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first = torch.nn.Parameter(torch.ones(8, dtype=torch.float32))
+        self.second = torch.nn.Parameter(torch.ones(8, dtype=torch.float32))
+
+
 def test_sync_model_weights_to_vllm_uses_direct_load_weights():
     model = _TinyModel()
 
@@ -228,3 +236,35 @@ def test_sync_model_weights_to_vllm_uses_apply_model_reload_weights():
     assert [name for name, _ in transferred] == ["proj.weight"]
     assert all(tensor.device.type == "cpu" for _name, tensor in transferred)
     assert result == 1
+
+
+def test_sync_model_weights_to_vllm_streams_apply_model_payloads_in_chunks(monkeypatch):
+    model = _TwoParamModel()
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def apply_model(self, fn):
+            class _WorkerModel:
+                def __init__(self) -> None:
+                    self.received = None
+
+                def load_weights(self, weight_pairs):
+                    self.received = list(weight_pairs)
+                    return {name for name, _ in self.received}
+
+            worker_model = _WorkerModel()
+            result = fn(worker_model)
+            self.calls.append((worker_model.received, result))
+            return [result]
+
+    monkeypatch.setattr(vllm_utils, "_APPLY_MODEL_SYNC_MAX_CHUNK_BYTES", 32)
+
+    engine = _Engine()
+    sync_model_weights_to_vllm(model, engine)
+
+    assert len(engine.calls) == 2
+    assert [name for name, _ in engine.calls[0][0]] == ["first"]
+    assert [name for name, _ in engine.calls[1][0]] == ["second"]
+    assert all(tensor.device.type == "cpu" for call, _ in engine.calls for _name, tensor in call)

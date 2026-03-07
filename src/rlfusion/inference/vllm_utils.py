@@ -6,6 +6,7 @@ import importlib
 import inspect
 import logging
 import os
+from collections.abc import Iterator
 from typing import Any, Literal, overload
 
 import torch
@@ -14,6 +15,7 @@ from rlfusion.envs import EnvBase
 
 logger = logging.getLogger(__name__)
 _APPLY_MODEL_SYNC_LOGGED = False
+_APPLY_MODEL_SYNC_MAX_CHUNK_BYTES = 1 << 30
 DEFAULT_COLOCATED_VLLM_ARGS: dict[str, Any] = {
     "gpu_memory_utilization": 0.5,
 }
@@ -29,6 +31,42 @@ class _ApplyModelReloadWeights:
     def __call__(self, worker_model: Any) -> int:
         loaded = worker_model.load_weights(self.weight_pairs)
         return len(self.weight_pairs) if loaded is None else len(loaded)
+
+
+def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
+
+
+def _iter_cpu_weight_chunks(
+    weight_pairs: list[tuple[str, torch.Tensor]],
+    *,
+    max_chunk_bytes: int | None = None,
+) -> Iterator[list[tuple[str, torch.Tensor]]]:
+    if max_chunk_bytes is None:
+        max_chunk_bytes = _APPLY_MODEL_SYNC_MAX_CHUNK_BYTES
+
+    current_chunk: list[tuple[str, torch.Tensor]] = []
+    current_chunk_bytes = 0
+
+    for name, tensor in weight_pairs:
+        cpu_tensor = tensor.to("cpu")
+        tensor_bytes = _tensor_nbytes(cpu_tensor)
+
+        if current_chunk and current_chunk_bytes + tensor_bytes > max_chunk_bytes:
+            yield current_chunk
+            current_chunk = []
+            current_chunk_bytes = 0
+
+        current_chunk.append((name, cpu_tensor))
+        current_chunk_bytes += tensor_bytes
+
+        if current_chunk_bytes >= max_chunk_bytes:
+            yield current_chunk
+            current_chunk = []
+            current_chunk_bytes = 0
+
+    if current_chunk:
+        yield current_chunk
 
 
 def ensure_vllm_env() -> None:
@@ -308,19 +346,34 @@ def sync_model_weights_to_vllm(model: Any, vllm_engine: Any) -> None:
         return
     except AttributeError as exc:
         if hasattr(vllm_engine, "apply_model"):
-            transfer_pairs = [(name, tensor.to("cpu")) for name, tensor in weight_pairs]
-            loaded_per_worker = vllm_engine.apply_model(_ApplyModelReloadWeights(transfer_pairs))
+            total_tensors_loaded = 0
+            chunk_count = 0
+            loaded_per_worker_total = 0
+
+            for chunk_index, transfer_pairs in enumerate(_iter_cpu_weight_chunks(weight_pairs), start=1):
+                chunk_count = chunk_index
+                loaded_per_worker = vllm_engine.apply_model(_ApplyModelReloadWeights(transfer_pairs))
+                total_tensors_loaded += len(transfer_pairs)
+                loaded_per_worker_total += sum(int(result) for result in loaded_per_worker)
+                logger.debug(
+                    "Synced vLLM weight chunk %d (%d tensors).",
+                    chunk_index,
+                    len(transfer_pairs),
+                )
+
             if not _APPLY_MODEL_SYNC_LOGGED:
                 logger.info(
                     "Using vLLM apply_model(load_weights) for trainer-to-engine "
-                    "weight sync; this is compatible with current vLLM releases but can "
-                    "be slower than dedicated weight-transfer backends."
+                    "weight sync in streamed chunks; this is compatible with current "
+                    "vLLM releases but can be slower than dedicated weight-transfer backends."
                 )
                 _APPLY_MODEL_SYNC_LOGGED = True
             logger.info(
-                "Synced %d parameter tensors to vLLM via apply_model reload (workers=%d).",
-                len(weight_pairs),
-                len(loaded_per_worker),
+                "Synced %d parameter tensors to vLLM via apply_model reload "
+                "(chunks=%d, loaded=%d).",
+                total_tensors_loaded,
+                chunk_count,
+                loaded_per_worker_total,
             )
             return
 
