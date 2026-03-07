@@ -63,6 +63,14 @@ uv pip install -e ".[vllm]"
 Set `engine="vllm"` in the `Evaluator` or `use_vllm=True` in the RL trainers, and optionally
 pass `vllm_args` (forwarded to `vllm.LLM`).
 
+Notes:
+- The current integration is verified against `vllm 0.16.x` and targets the same v1 worker APIs
+  used by `vllm 0.17.0`. `vllm 0.17.x` also requires a compatible `torch` / `torchvision` stack.
+- `vllm_enable_sleep=True` automatically enables the underlying vLLM sleep mode.
+- When combining `use_accelerate=True` with `use_vllm=True`, keep
+  `tensor_parallel_size=1` and `pipeline_parallel_size=1` so each trainer process owns only its
+  local vLLM engine.
+
 vLLM now uses its own default attention-backend auto-selection unless you override it yourself.
 If you need to force a backend, use:
 

@@ -1,9 +1,15 @@
 import os
 
+import pytest
 import torch
 
 from rlfusion.envs import EnvBase
-from rlfusion.inference.vllm_utils import ensure_vllm_env, sample_completions_batch_vllm
+from rlfusion.inference.vllm_utils import (
+    ensure_vllm_env,
+    prepare_vllm_runtime_args,
+    sample_completions_batch_vllm,
+    sync_model_weights_to_vllm,
+)
 
 
 class _DummyEnv(EnvBase):
@@ -89,18 +95,96 @@ def test_sample_completions_batch_vllm_returns_full_attention_mask():
 def test_ensure_vllm_env_preserves_backend_autoselection(monkeypatch):
     monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
     monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    monkeypatch.delenv("VLLM_ALLOW_INSECURE_SERIALIZATION", raising=False)
 
     ensure_vllm_env()
 
     assert "VLLM_ATTENTION_BACKEND" not in os.environ
     assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+    assert os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] == "1"
 
 
 def test_ensure_vllm_env_preserves_explicit_backend_override(monkeypatch):
     monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
     monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0")
 
     ensure_vllm_env()
 
     assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASH_ATTN"
     assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+    assert os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] == "0"
+
+
+def test_prepare_vllm_runtime_args_enables_sleep_mode():
+    resolved = prepare_vllm_runtime_args(
+        {"tensor_parallel_size": 2},
+        enable_sleep=True,
+        use_accelerate=False,
+    )
+
+    assert resolved["tensor_parallel_size"] == 2
+    assert resolved["enable_sleep_mode"] is True
+
+
+def test_prepare_vllm_runtime_args_rejects_multi_gpu_vllm_with_accelerate():
+    with pytest.raises(ValueError, match="per-process vLLM engines"):
+        prepare_vllm_runtime_args(
+            {"tensor_parallel_size": 2},
+            enable_sleep=False,
+            use_accelerate=True,
+        )
+
+
+class _TinyModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.proj = torch.nn.Linear(2, 2, bias=False)
+
+
+def test_sync_model_weights_to_vllm_uses_direct_load_weights():
+    model = _TinyModel()
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.weight_pairs = None
+
+        def load_weights(self, weight_pairs):
+            self.weight_pairs = list(weight_pairs)
+
+    engine = _Engine()
+    sync_model_weights_to_vllm(model, engine)
+
+    assert engine.weight_pairs is not None
+    assert [name for name, _ in engine.weight_pairs] == ["proj.weight"]
+
+
+def test_sync_model_weights_to_vllm_uses_apply_model_reload_weights():
+    model = _TinyModel()
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def apply_model(self, fn):
+            class _WorkerModel:
+                def __init__(self) -> None:
+                    self.received = None
+
+                def load_weights(self, weight_pairs):
+                    self.received = list(weight_pairs)
+                    return {"proj.weight"}
+
+            worker_model = _WorkerModel()
+            result = fn(worker_model)
+            self.calls.append((worker_model.received, result))
+            return [result]
+
+    engine = _Engine()
+    sync_model_weights_to_vllm(model, engine)
+
+    assert len(engine.calls) == 1
+    transferred, result = engine.calls[0]
+    assert [name for name, _ in transferred] == ["proj.weight"]
+    assert all(tensor.device.type == "cpu" for _name, tensor in transferred)
+    assert result == 1

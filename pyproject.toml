@@ -28,7 +28,10 @@ flash = [
     "flash-attn>=2.8.3; platform_system == 'Linux'"
 ]
 vllm = [
-    "vllm; platform_system == 'Linux'"
+    "torch>=2.10.0,<2.11; platform_system == 'Linux'",
+    "torchaudio>=2.10.0,<2.11; platform_system == 'Linux'",
+    "torchvision>=0.25.0,<0.26; platform_system == 'Linux'",
+    "vllm>=0.17.0,<0.18; platform_system == 'Linux'",
 ]
 test = [
     "pytest"

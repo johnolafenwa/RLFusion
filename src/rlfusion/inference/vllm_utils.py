@@ -13,9 +13,19 @@ import torch
 from rlfusion.envs import EnvBase
 
 logger = logging.getLogger(__name__)
+_APPLY_MODEL_SYNC_LOGGED = False
 
 CompletionBatch = tuple[torch.Tensor, list[str], list[int], list[int]]
 CompletionBatchWithMask = tuple[torch.Tensor, list[str], list[int], list[int], torch.Tensor]
+
+
+class _ApplyModelReloadWeights:
+    def __init__(self, weight_pairs: list[tuple[str, torch.Tensor]]) -> None:
+        self.weight_pairs = weight_pairs
+
+    def __call__(self, worker_model: Any) -> int:
+        loaded = worker_model.load_weights(self.weight_pairs)
+        return len(self.weight_pairs) if loaded is None else len(loaded)
 
 
 def ensure_vllm_env() -> None:
@@ -28,6 +38,13 @@ def ensure_vllm_env() -> None:
     if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") is None:
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
         logger.info("Set VLLM_WORKER_MULTIPROC_METHOD=spawn for vLLM.")
+
+    if os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION") is None:
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+        logger.info(
+            "Set VLLM_ALLOW_INSECURE_SERIALIZATION=1 for vLLM worker callable "
+            "serialization used by trainer weight sync."
+        )
 
 
 def load_vllm_engine(model_path_or_id: str, vllm_args: dict[str, Any]) -> tuple[Any, type, set[str]]:
@@ -42,6 +59,33 @@ def load_vllm_engine(model_path_or_id: str, vllm_args: dict[str, Any]) -> tuple[
     llm = llm_cls(model=model_path_or_id, **vllm_args)
     param_keys = set(inspect.signature(sampling_params_cls).parameters.keys())
     return llm, sampling_params_cls, param_keys
+
+
+def prepare_vllm_runtime_args(
+    vllm_args: dict[str, Any] | None,
+    *,
+    enable_sleep: bool,
+    use_accelerate: bool,
+) -> dict[str, Any]:
+    resolved = {} if vllm_args is None else dict(vllm_args)
+
+    tensor_parallel_size = int(resolved.get("tensor_parallel_size", 1))
+    pipeline_parallel_size = int(resolved.get("pipeline_parallel_size", 1))
+    if tensor_parallel_size <= 0:
+        raise ValueError("vllm_args['tensor_parallel_size'] must be >= 1.")
+    if pipeline_parallel_size <= 0:
+        raise ValueError("vllm_args['pipeline_parallel_size'] must be >= 1.")
+
+    if use_accelerate and (tensor_parallel_size != 1 or pipeline_parallel_size != 1):
+        raise ValueError(
+            "use_vllm with use_accelerate only supports per-process vLLM engines "
+            "(tensor_parallel_size=1 and pipeline_parallel_size=1)."
+        )
+
+    if enable_sleep:
+        resolved["enable_sleep_mode"] = True
+
+    return resolved
 
 
 def build_sampling_params(
@@ -200,12 +244,14 @@ def sync_model_weights_to_vllm(model: Any, vllm_engine: Any) -> None:
 
     Handles DDP / Accelerate wrappers by unwrapping via ``.module``.
     Prefers ``llm.load_weights()`` (vLLM >= 0.7), falling back to the
-    internal model executor path for older versions.
+    legacy internal model executor path, then the current ``apply_model``
+    worker hook used by recent vLLM releases.
     """
+    global _APPLY_MODEL_SYNC_LOGGED
     unwrapped = model.module if hasattr(model, "module") else model
 
     # Collect (name, tensor) pairs
-    weight_pairs = [(name, param.data) for name, param in unwrapped.named_parameters()]
+    weight_pairs = [(name, param.detach()) for name, param in unwrapped.named_parameters()]
 
     # vLLM >= 0.7 exposes load_weights() directly on the LLM object
     if hasattr(vllm_engine, "load_weights"):
@@ -224,10 +270,28 @@ def sync_model_weights_to_vllm(model: Any, vllm_engine: Any) -> None:
         )
         model_runner.load_weights(weight_pairs)
         logger.info("Synced %d parameter tensors to vLLM via internal model runner.", len(weight_pairs))
+        return
     except AttributeError as exc:
+        if hasattr(vllm_engine, "apply_model"):
+            transfer_pairs = [(name, tensor.to("cpu")) for name, tensor in weight_pairs]
+            loaded_per_worker = vllm_engine.apply_model(_ApplyModelReloadWeights(transfer_pairs))
+            if not _APPLY_MODEL_SYNC_LOGGED:
+                logger.info(
+                    "Using vLLM apply_model(load_weights) for trainer-to-engine "
+                    "weight sync; this is compatible with current vLLM releases but can "
+                    "be slower than dedicated weight-transfer backends."
+                )
+                _APPLY_MODEL_SYNC_LOGGED = True
+            logger.info(
+                "Synced %d parameter tensors to vLLM via apply_model reload (workers=%d).",
+                len(weight_pairs),
+                len(loaded_per_worker),
+            )
+            return
+
         raise RuntimeError(
             "Unable to sync weights to vLLM engine. "
-            "Ensure you are using vLLM >= 0.7 or a compatible version."
+            "Ensure you are using a compatible vLLM version."
         ) from exc
 
 
@@ -249,13 +313,19 @@ def vllm_sleep(vllm_engine: Any, level: int = 2) -> None:
         logger.debug("vLLM engine does not support sleep(); skipping.")
 
 
-def vllm_wake_up(vllm_engine: Any) -> None:
+def vllm_wake_up(vllm_engine: Any, tags: list[str] | None = None) -> None:
     """Wake up a sleeping vLLM engine before generation.
 
     No-op if the API is unavailable.
     """
     if hasattr(vllm_engine, "wake_up"):
-        vllm_engine.wake_up()
-        logger.debug("vLLM engine woken up.")
+        if tags is None:
+            vllm_engine.wake_up()
+        else:
+            try:
+                vllm_engine.wake_up(tags=tags)
+            except TypeError:
+                vllm_engine.wake_up()
+        logger.debug("vLLM engine woken up (tags=%s).", tags)
     else:
         logger.debug("vLLM engine does not support wake_up(); skipping.")

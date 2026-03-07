@@ -177,7 +177,7 @@ def test_grpo_vllm_sampling_wakes_syncs_and_sleeps_when_dirty(monkeypatch):
 
     monkeypatch.setattr(
         "rlfusion.trainers.grpo_trainer.vllm_wake_up",
-        lambda engine: events.append("wake"),
+        lambda engine, tags=None: events.append(f"wake:{tags or 'all'}"),
     )
     monkeypatch.setattr(
         "rlfusion.trainers.grpo_trainer.sync_model_weights_to_vllm",
@@ -201,7 +201,7 @@ def test_grpo_vllm_sampling_wakes_syncs_and_sleeps_when_dirty(monkeypatch):
     assert texts == ["ok"]
     assert prompt_lengths == [1]
     assert completion_lengths == [1]
-    assert events == ["wake", "sync", "sample", "sleep"]
+    assert events == ["wake:['weights']", "sync", "wake:['kv_cache']", "sample", "sleep"]
     assert trainer._vllm_dirty is False
 
 
@@ -223,7 +223,7 @@ def test_onpolicy_vllm_sampling_wakes_syncs_and_sleeps_when_dirty(monkeypatch):
 
     monkeypatch.setattr(
         "rlfusion.trainers.onpolicy_distillation_trainer.vllm_wake_up",
-        lambda engine: events.append("wake"),
+        lambda engine, tags=None: events.append(f"wake:{tags or 'all'}"),
     )
     monkeypatch.setattr(
         "rlfusion.trainers.onpolicy_distillation_trainer.sync_model_weights_to_vllm",
@@ -247,5 +247,5 @@ def test_onpolicy_vllm_sampling_wakes_syncs_and_sleeps_when_dirty(monkeypatch):
     assert texts == ["ok"]
     assert prompt_lengths == [1]
     assert completion_lengths == [1]
-    assert events == ["wake", "sync", "sample", "sleep"]
+    assert events == ["wake:['weights']", "sync", "wake:['kv_cache']", "sample", "sleep"]
     assert trainer._vllm_dirty is False

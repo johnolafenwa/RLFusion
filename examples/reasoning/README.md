@@ -202,7 +202,9 @@ uv pip install -e ".[vllm]"
 
 - Start with `--vllm-gpu-memory-utilization 0.5`. If you get OOM during training, lower it. If generation is slow, raise it.
 - `--vllm-enable-sleep` adds some latency per step (wake/sleep overhead) but allows higher memory utilization since vLLM releases GPU memory during the training phase.
+- `--vllm-enable-sleep` automatically enables the underlying vLLM sleep mode.
 - vLLM weights are automatically synced from the training model after each optimizer step.
+- With `--use-accelerate`, keep `--vllm-tensor-parallel-size 1` so each trainer process uses only its local GPU(s).
 - vLLM now uses its own default attention-backend auto-selection unless you explicitly override `VLLM_ATTENTION_BACKEND`.
 
 ## Notes

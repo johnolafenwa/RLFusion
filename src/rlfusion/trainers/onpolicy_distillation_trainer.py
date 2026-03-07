@@ -28,6 +28,7 @@ from rlfusion.inference.hf_utils import sample_completions_batch_hf
 from rlfusion.inference.vllm_utils import (
     build_sampling_params,
     load_vllm_engine,
+    prepare_vllm_runtime_args,
     sample_completions_batch_vllm,
     sync_model_weights_to_vllm,
     vllm_sleep,
@@ -291,9 +292,16 @@ class OnPolicyDistillationTrainer:
         self._vllm_engine: Any = None
         self._vllm_sampling_params_cls: Any = None
         self._vllm_sampling_param_keys: Any = None
+        resolved_vllm_args = {}
+        if use_vllm:
+            resolved_vllm_args = prepare_vllm_runtime_args(
+                vllm_args,
+                enable_sleep=vllm_enable_sleep,
+                use_accelerate=use_accelerate,
+            )
         if use_vllm:
             self._vllm_engine, self._vllm_sampling_params_cls, self._vllm_sampling_param_keys = (
-                load_vllm_engine(model, vllm_args or {})
+                load_vllm_engine(model, resolved_vllm_args)
             )
             sync_model_weights_to_vllm(self.model, self._vllm_engine)
             logger.info("vLLM colocated engine initialized for generation.")
@@ -358,11 +366,16 @@ class OnPolicyDistillationTrainer:
     def _prepare_vllm_for_generation(self) -> None:
         if not self.use_vllm:
             return
-        if self.vllm_enable_sleep:
-            vllm_wake_up(self._vllm_engine)
         if self._vllm_dirty:
+            if self.vllm_enable_sleep:
+                vllm_wake_up(self._vllm_engine, tags=["weights"])
             sync_model_weights_to_vllm(self.model, self._vllm_engine)
             self._vllm_dirty = False
+            if self.vllm_enable_sleep:
+                vllm_wake_up(self._vllm_engine, tags=["kv_cache"])
+            return
+        if self.vllm_enable_sleep:
+            vllm_wake_up(self._vllm_engine)
 
     def _finish_vllm_generation(self) -> None:
         if self.use_vllm and self.vllm_enable_sleep:
