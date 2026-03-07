@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from rlfusion.envs import EnvBase
+import rlfusion.trainers.sft_trainer as sft_trainer_module
 from rlfusion.trainers.sft_trainer import SFTTrainer
 
 
@@ -60,6 +61,16 @@ class DummyEvalModel(torch.nn.Module):
         _ = (attention_mask, labels)
         loss = input_ids.sum().float() * 0.0 + self.weight * 0.0
         return SimpleNamespace(loss=loss)
+
+
+class DummyWrappedEvalModel(torch.nn.Module):
+    def __init__(self, module: torch.nn.Module) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        _ = (input_ids, attention_mask, labels)
+        raise AssertionError("DDP-wrapped model should not be used for single-rank eval.")
 
 
 def _make_trainer(mask_prompt=True):
@@ -208,6 +219,33 @@ def test_sft_returns_empty_batch_when_all_samples_dropped(caplog):
     assert "Dropped 1/1 sample(s)" in caplog.text
 
 
+def test_sft_all_ranks_have_batch_returns_local_value_without_accelerate():
+    trainer = SFTTrainer.__new__(SFTTrainer)
+    trainer.accelerator = None
+
+    assert trainer._all_ranks_have_batch(True) is True
+    assert trainer._all_ranks_have_batch(False) is False
+
+
+def test_sft_all_ranks_have_batch_uses_distributed_min(monkeypatch):
+    trainer = SFTTrainer.__new__(SFTTrainer)
+    trainer.accelerator = SimpleNamespace(device=torch.device("cpu"))
+
+    monkeypatch.setattr(sft_trainer_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(sft_trainer_module.dist, "is_initialized", lambda: True)
+
+    reduced = {}
+
+    def fake_all_reduce(tensor, op):
+        reduced["op"] = op
+        tensor.fill_(0)
+
+    monkeypatch.setattr(sft_trainer_module.dist, "all_reduce", fake_all_reduce)
+
+    assert trainer._all_ranks_have_batch(True) is False
+    assert reduced["op"] == sft_trainer_module.dist.ReduceOp.MIN
+
+
 def test_sft_compute_reward_returns_none_for_non_finite_values():
     trainer = SFTTrainer.__new__(SFTTrainer)
     env = DummyRewardEnv(prompt=[{"role": "user", "content": "q"}], answer=None)
@@ -242,6 +280,38 @@ def test_sft_test_restores_model_mode():
     trainer.test(dataset=dataset, num_batches=1)
 
     assert trainer.model.training is False
+
+
+def test_sft_test_uses_unwrapped_model_for_eval():
+    trainer = SFTTrainer.__new__(SFTTrainer)
+    trainer.batch_size = 1
+    trainer.eval_sample_completions = False
+    trainer._wandb = None
+    underlying_model = DummyEvalModel()
+    trainer.model = DummyWrappedEvalModel(underlying_model)
+    trainer.model.eval()
+    trainer.accelerator = object()
+    trainer._unwrap_model_for_saving = lambda: underlying_model
+
+    def _extract_sample(sample):
+        _ = sample
+        return [{"role": "user", "content": "q"}], "a"
+
+    def _build_batch(prompts, responses, mask_prompt=True):
+        _ = (prompts, responses, mask_prompt)
+        return (
+            torch.tensor([[1, 2]], dtype=torch.long),
+            torch.tensor([[1, 1]], dtype=torch.long),
+            torch.tensor([[-100, 2]], dtype=torch.long),
+        )
+
+    trainer._extract_sample = _extract_sample
+    trainer._build_batch = _build_batch
+
+    dataset = [DummyRewardEnv(prompt=[{"role": "user", "content": "q"}], answer="a")]
+    results = trainer.test(dataset=dataset, num_batches=1)
+
+    assert "ce_loss" in results
 
 
 @pytest.mark.parametrize(

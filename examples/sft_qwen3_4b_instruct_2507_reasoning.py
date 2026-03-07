@@ -21,6 +21,20 @@ from rlfusion.envs import EnvBase
 from rlfusion.trainers import SFTTrainer
 
 
+def _unwrap_model(model: object) -> object:
+    return model.module if hasattr(model, "module") else model
+
+
+def _get_adamw8bit() -> object:
+    try:
+        from bitsandbytes.optim import AdamW8bit
+    except ImportError as exc:
+        raise ImportError(
+            "bitsandbytes is required for this example. Install with: uv sync --extra gpu-train --extra vllm --extra dev --extra test"
+        ) from exc
+    return AdamW8bit
+
+
 @dataclass
 class ReasoningSFTEnv(EnvBase):
     def get_reward(self, prediction: str | None) -> float:
@@ -143,6 +157,7 @@ def main() -> None:
         logging_steps=args.logging_steps,
         eval_steps=args.eval_steps,
         max_seq_len=args.max_seq_len,
+        optimizer=_get_adamw8bit(),
         optimizer_args={"lr": args.lr},
         output_dir=args.output_dir,
         seed=args.seed,
@@ -151,7 +166,7 @@ def main() -> None:
     )
 
     if args.gradient_checkpointing:
-        checkpointing_enable = getattr(trainer.model, "gradient_checkpointing_enable", None)
+        checkpointing_enable = getattr(_unwrap_model(trainer.model), "gradient_checkpointing_enable", None)
         if callable(checkpointing_enable):
             checkpointing_enable()
         else:

@@ -26,6 +26,16 @@ from rlfusion.utils import get_boxed_answer
 DEFAULT_SFT_CHECKPOINT = "./outputs/qwen3_4b_instruct_2507_reasoning_sft/final"
 
 
+def _get_adamw8bit() -> object:
+    try:
+        from bitsandbytes.optim import AdamW8bit
+    except ImportError as exc:
+        raise ImportError(
+            "bitsandbytes is required for this example. Install with: uv sync --extra gpu-train --extra vllm --extra dev --extra test"
+        ) from exc
+    return AdamW8bit
+
+
 @dataclass
 class ReasoningRLEnv(EnvBase):
     def get_reward(self, prediction: str | None) -> float:
@@ -218,6 +228,7 @@ def main() -> None:
             "top_k": args.top_k,
             "min_p": args.min_p,
         },
+        optimizer=_get_adamw8bit(),
         optimizer_args={"lr": args.learning_rate},
         batch_size=args.batch_size,
         group_size=args.group_size,

@@ -17,6 +17,10 @@ from rlfusion.trainers import SFTTrainer
 logger = logging.getLogger(__name__)
 
 
+def _unwrap_model(model: object) -> object:
+    return model.module if hasattr(model, "module") else model
+
+
 @dataclass
 class ReasoningSFTEnv(EnvBase):
     def get_reward(self, prediction: str | None) -> float:
@@ -137,14 +141,14 @@ def main() -> None:
         logging_steps=args.logging_steps,
         eval_steps=args.eval_steps,
         max_seq_len=args.max_seq_len,
-        optimizer_args={"lr": args.lr},
+        optimizer_args={"lr": args.lr, "foreach": False},
         output_dir=args.output_dir,
         seed=args.seed,
         use_accelerate=args.use_accelerate,
         log_level=args.log_level,
     )
     if args.gradient_checkpointing:
-        checkpointing_enable = getattr(trainer.model, "gradient_checkpointing_enable", None)
+        checkpointing_enable = getattr(_unwrap_model(trainer.model), "gradient_checkpointing_enable", None)
         if callable(checkpointing_enable):
             checkpointing_enable()
         else:

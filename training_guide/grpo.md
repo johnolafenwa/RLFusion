@@ -60,6 +60,18 @@ uv pip install -e ".[vllm]"
 The repo-standard vLLM stack is `vllm 0.17.x` with matching Linux builds of
 `torch 2.10.x`, `torchaudio 2.10.x`, and `torchvision 0.25.x`.
 
+For HF-side FlashAttention, Liger, and `AdamW8bit`, install the repo-standard CUDA training extra:
+
+```bash
+uv sync --extra gpu-train --extra vllm --extra dev --extra test
+```
+
+Notes:
+- On CUDA, HF trainers automatically use the fastest available HF attention backend.
+- If `liger-kernel` is installed, the trainable HF model path automatically uses the Liger wrappers.
+- `flash-attn` may compile from source on the current `torch 2.10.x` stack because upstream does
+  not ship a matching wheel for every Linux platform.
+
 Parameters:
 - `use_vllm` — leave unset for the default behavior (`True` on CUDA, `False` otherwise), set
   `False` to force HF generation, or set `True` to require vLLM explicitly.

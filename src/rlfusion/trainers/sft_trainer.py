@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional, Iterable, Tuple, Any, Literal, cast
 
 import torch
+import torch.distributed as dist
 from torch.optim import Optimizer, AdamW
 from torch.optim.lr_scheduler import LRScheduler
 
@@ -273,15 +274,28 @@ class SFTTrainer:
             logger.warning("Tokenizer has no chat_template; apply_chat_template may fail.")
 
     def _is_main_process(self) -> bool:
-        return is_main_process(self.accelerator)
+        return is_main_process(getattr(self, "accelerator", None))
 
     def _unwrap_model_for_saving(self) -> torch.nn.Module:
-        return unwrap_model_for_saving(self.model, self.accelerator)
+        return unwrap_model_for_saving(self.model, getattr(self, "accelerator", None))
+
+    def _all_ranks_have_batch(self, local_has_batch: bool) -> bool:
+        accelerator = getattr(self, "accelerator", None)
+        if accelerator is None or not dist.is_available() or not dist.is_initialized():
+            return local_has_batch
+
+        has_batch = torch.tensor(
+            1 if local_has_batch else 0,
+            device=accelerator.device,
+            dtype=torch.int32,
+        )
+        dist.all_reduce(has_batch, op=dist.ReduceOp.MIN)
+        return bool(has_batch.item())
 
     def sample_completions_batch(
         self, envs: list[EnvBase]
     ) -> Tuple[torch.Tensor, list[str], list[int], list[int]]:
-        model = cast(Any, self.model)
+        model = cast(Any, self._unwrap_model_for_saving())
         return sample_completions_batch_hf(
             model=model,
             tokenizer=self.tokenizer,
@@ -497,8 +511,11 @@ class SFTTrainer:
                     responses.append(None if response is None else str(response))
 
                 input_ids, attention_mask, labels = self._build_batch(prompts, responses)
-                if input_ids.size(0) > 0:
+                if self._all_ranks_have_batch(input_ids.size(0) > 0):
                     break
+                input_ids = torch.empty((0, 0), dtype=torch.long)
+                attention_mask = torch.empty((0, 0), dtype=torch.long)
+                labels = torch.empty((0, 0), dtype=torch.long)
 
             if input_ids.size(0) == 0:
                 logger.warning(
@@ -596,6 +613,7 @@ class SFTTrainer:
 
         was_training = self.model.training
         self.model.eval()
+        eval_model = cast(Any, self._unwrap_model_for_saving())
 
         try:
             if num_batches is None:
@@ -634,12 +652,12 @@ class SFTTrainer:
                     )
                     if input_ids.size(0) == 0:
                         continue
-                    model_device = next(self.model.parameters()).device
+                    model_device = next(eval_model.parameters()).device
                     input_ids = input_ids.to(model_device)
                     attention_mask = attention_mask.to(model_device)
                     labels = labels.to(model_device)
                     with torch.no_grad():
-                        outputs = self.model(
+                        outputs = eval_model(
                             input_ids=input_ids,
                             attention_mask=attention_mask,
                             labels=labels,

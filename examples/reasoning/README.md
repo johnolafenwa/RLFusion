@@ -23,11 +23,14 @@ uv pip install -e .
 Optional accelerators:
 
 ```bash
-# FlashAttention support (Linux + CUDA)
-uv pip install -e ".[flash]" --no-build-isolation
+# HF FlashAttention + Liger + bitsandbytes
+uv sync --extra gpu-train --extra dev --extra test
 
 # vLLM support for RL generation
-uv pip install -e ".[vllm]"
+uv sync --extra vllm
+
+# Full validated CUDA stack
+uv sync --extra gpu-train --extra vllm --extra dev --extra test
 ```
 
 `reasoning_sft_train.py` uses native splits from `johnolafenwa/reasoning-sft`:

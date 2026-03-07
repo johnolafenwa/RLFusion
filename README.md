@@ -22,30 +22,45 @@ python -m pip install uv
 Optional extras:
 
 ```bash
-# FlashAttention support (Linux + CUDA)
-uv pip install -e ".[flash]" --no-build-isolation
+# Repo-standard HF CUDA training stack:
+# FlashAttention + Liger + bitsandbytes/AdamW8bit
+uv pip install -e ".[gpu-train]" --no-build-isolation
 
 # vLLM support (Linux + CUDA)
 uv pip install -e ".[vllm]"
 
-# Both
-uv pip install -e ".[flash,vllm]" --no-build-isolation
+# Full validated stack
+uv sync --extra gpu-train --extra vllm --extra dev --extra test
 ```
 
-## Flash Attention (Optional)
-If you have a CUDA-enabled GPU and want FlashAttention acceleration:
+## HF CUDA Training Stack (Optional)
+If you have a CUDA-enabled GPU and want the repo-standard HF training stack:
 
 ```bash
-uv pip install -e ".[flash]" --no-build-isolation
+uv sync --extra gpu-train --extra vllm --extra dev --extra test
 ```
 
-RLFusion selects the fastest supported HF attention backend by default:
+This installs:
+- `flash-attn` for HF FlashAttention
+- `liger-kernel` so HF trainers automatically use the Liger model wrappers when available
+- `bitsandbytes` for memory-efficient optimizers such as `AdamW8bit`
+
+RLFusion selects the fastest supported HF attention backend by default on CUDA:
 - FlashAttention-3 on Hopper GPUs when a compatible FA3 backend is available
 - FlashAttention-2 on Ampere/Ada/Hopper GPUs when a compatible FA2 backend is available
 - PyTorch SDPA otherwise
 
 FlashAttention-3 is Hopper-only and requires a compatible FA3 installation. If no compatible
-FlashAttention backend is available, the trainers automatically fall back to PyTorch SDPA.
+FlashAttention backend is available, the trainers automatically fall back to PyTorch SDPA. When
+`liger-kernel` is installed, the HF trainers also switch to the Liger-backed model classes
+automatically.
+
+Current stack caveat:
+- The repo-standard `vllm 0.17.x` stack pins `torch 2.10.x`.
+- Upstream `flash-attn 2.8.3` does not publish a matching wheel for every `torch 2.10` platform,
+  so Linux installs may compile `flash-attn` from source on first install.
+- On single-architecture Ampere/Ada hosts, setting `FLASH_ATTN_CUDA_ARCHS=80` before install can
+  reduce source-build time and memory pressure.
 
 You can override the automatic choice with:
 
@@ -68,6 +83,11 @@ forwarded to `vllm.LLM`.
 Notes:
 - The repo standardizes on `vllm 0.17.x` on Linux, with a matching `torch 2.10.x` /
   `torchaudio 2.10.x` / `torchvision 0.25.x` stack from the `vllm` extra.
+- For HF FlashAttention + Liger + `AdamW8bit` on the same stack, install the `gpu-train` extra:
+
+  ```bash
+  uv sync --extra gpu-train --extra vllm --extra dev --extra test
+  ```
 - `vllm_enable_sleep=True` automatically enables the underlying vLLM sleep mode.
 - When combining `use_accelerate=True` with `use_vllm=True`, keep
   `tensor_parallel_size=1` and `pipeline_parallel_size=1` so each trainer process owns exactly one
