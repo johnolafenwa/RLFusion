@@ -14,6 +14,22 @@ Scripts:
 
 ## 1) Install and run SFT
 
+From the repo root:
+
+```bash
+uv pip install -e .
+```
+
+Optional accelerators:
+
+```bash
+# FlashAttention support (Linux + CUDA)
+uv pip install -e ".[flash]" --no-build-isolation
+
+# vLLM support for RL generation
+uv pip install -e ".[vllm]"
+```
+
 `reasoning_sft_train.py` uses native splits from `johnolafenwa/reasoning-sft`:
 
 - `train` for training
@@ -165,18 +181,12 @@ vLLM is an optional dependency used to accelerate generation during GRPO trainin
 
 - Linux with CUDA (vLLM does not support macOS)
 - CUDA 12.1+
-- Python 3.9+
+- Python 3.12+ for this repo
 
 **Install:**
 
 ```bash
-pip install vllm
-```
-
-Or with uv:
-
-```bash
-uv pip install vllm
+uv pip install -e ".[vllm]"
 ```
 
 **vLLM flags for GRPO:**
@@ -193,6 +203,7 @@ uv pip install vllm
 - Start with `--vllm-gpu-memory-utilization 0.5`. If you get OOM during training, lower it. If generation is slow, raise it.
 - `--vllm-enable-sleep` adds some latency per step (wake/sleep overhead) but allows higher memory utilization since vLLM releases GPU memory during the training phase.
 - vLLM weights are automatically synced from the training model after each optimizer step.
+- vLLM now uses its own default attention-backend auto-selection unless you explicitly override `VLLM_ATTENTION_BACKEND`.
 
 ## Notes
 

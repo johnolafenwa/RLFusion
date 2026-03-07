@@ -24,12 +24,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+flash = [
+    "flash-attn>=2.8.3; platform_system == 'Linux'"
+]
+vllm = [
+    "vllm; platform_system == 'Linux'"
+]
 test = [
     "pytest"
 ]
 dev = [
     "ruff",
     "ty"
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+    "ty",
 ]
 
 [tool.setuptools]
@@ -40,13 +53,6 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
-[tool.uv]
-dev-dependencies = [
-    "pytest",
-    "ruff",
-    "ty",
-]
 
 [tool.ruff]
 line-length = 100

@@ -1,6 +1,5 @@
 """Trainer utilities: device selection, seeding, formatting, mask helpers."""
 
-import importlib.util
 import json
 import os
 import random
@@ -9,6 +8,11 @@ from typing import Optional, Sequence, Any
 
 import numpy as np
 import torch
+from transformers.utils.import_utils import (
+    is_flash_attn_2_available,
+    is_flash_attn_3_available,
+    is_kernels_available,
+)
 
 from rlfusion.trainers.types import AttentionMask, TokenIds
 
@@ -42,17 +46,39 @@ def configure_torch_backends():
         torch.backends.cudnn.deterministic = False
 
 
+def _all_visible_cuda_devices_support(min_major: int) -> bool:
+    if not torch.cuda.is_available():
+        return False
+    device_count = torch.cuda.device_count()
+    if device_count <= 0:
+        return False
+    for index in range(device_count):
+        major, _minor = torch.cuda.get_device_capability(index)
+        if major < min_major:
+            return False
+    return True
+
+
 def resolve_attention_implementation(device_map: object) -> str:
     forced_attn_impl = os.getenv("RLFUSION_ATTN_IMPLEMENTATION")
     if forced_attn_impl:
         return forced_attn_impl
-    if device_map != "auto":
-        return "sdpa"
     if not torch.cuda.is_available():
         return "sdpa"
-    if importlib.util.find_spec("flash_attn") is None:
-        return "sdpa"
-    return "flash_attention_2"
+
+    # FlashAttention-3 is Hopper-only (compute capability >= 9.0).
+    if _all_visible_cuda_devices_support(9) and (
+        is_flash_attn_3_available() or is_kernels_available()
+    ):
+        return "flash_attention_3"
+
+    # FlashAttention-2 supports Ampere/Ada/Hopper CUDA GPUs.
+    if _all_visible_cuda_devices_support(8) and (
+        is_flash_attn_2_available() or is_kernels_available()
+    ):
+        return "flash_attention_2"
+
+    return "sdpa"
 
 
 def get_tokenizer_compat_kwargs(model_id_or_path: str) -> dict[str, Any]:

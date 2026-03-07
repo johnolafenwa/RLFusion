@@ -44,3 +44,32 @@ Notes:
 - `batch_size` is per-process; effective batch size is `batch_size * num_processes`.
 - Student and teacher models are loaded in each process; plan GPU memory accordingly.
 - Checkpoints and evaluation (when `eval_steps` + `eval_dataset` are set) run on the main process.
+- On compatible CUDA GPUs, RLFusion now defaults to FlashAttention automatically. Hopper prefers FA3; Ampere/Ada/Hopper otherwise prefer FA2.
+
+## vLLM-Accelerated Generation
+
+On-policy distillation also supports colocated vLLM generation through `use_vllm=True`.
+
+```python
+trainer = OnPolicyDistillationTrainer(
+    model="your-student-model",
+    teacher_model="your-teacher-model",
+    train_dataset=dataset,
+    use_vllm=True,
+    vllm_args={
+        "gpu_memory_utilization": 0.5,
+        "tensor_parallel_size": 1,
+    },
+    # ... other args
+)
+```
+
+Install vLLM first (Linux + CUDA only):
+
+```bash
+uv pip install -e ".[vllm]"
+```
+
+Notes:
+- vLLM now uses its own default attention-backend auto-selection unless you explicitly override `VLLM_ATTENTION_BACKEND`.
+- `vllm_enable_sleep=True` can reduce peak memory pressure at the cost of per-step wake/sleep overhead.

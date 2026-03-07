@@ -1,7 +1,9 @@
+import os
+
 import torch
 
 from rlfusion.envs import EnvBase
-from rlfusion.inference.vllm_utils import sample_completions_batch_vllm
+from rlfusion.inference.vllm_utils import ensure_vllm_env, sample_completions_batch_vllm
 
 
 class _DummyEnv(EnvBase):
@@ -82,3 +84,23 @@ def test_sample_completions_batch_vllm_returns_full_attention_mask():
 
     assert torch.equal(sequences, expected_sequences)
     assert torch.equal(attention_mask, expected_attention_mask)
+
+
+def test_ensure_vllm_env_preserves_backend_autoselection(monkeypatch):
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+
+    ensure_vllm_env()
+
+    assert "VLLM_ATTENTION_BACKEND" not in os.environ
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+
+def test_ensure_vllm_env_preserves_explicit_backend_override(monkeypatch):
+    monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "FLASH_ATTN")
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+
+    ensure_vllm_env()
+
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASH_ATTN"
+    assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"

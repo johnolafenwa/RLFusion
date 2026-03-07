@@ -164,11 +164,11 @@ class SFTTrainer:
             "attn_implementation": attn_implementation,
         }
         if device == "cuda":
-            model_kwargs["torch_dtype"] = (
+            model_kwargs["dtype"] = (
                 torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
             )
         elif device == "mps":
-            model_kwargs["torch_dtype"] = torch.float16
+            model_kwargs["dtype"] = torch.float16
         self.model = AutoModelForCausalLM.from_pretrained(
             model,
             **model_kwargs,

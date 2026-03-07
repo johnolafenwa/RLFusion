@@ -19,24 +19,56 @@ If you don't have `uv` installed:
 python -m pip install uv
 ```
 
-## Flash Attention (Optional)
-If you have a CUDA-enabled GPU and want FlashAttention2:
+Optional extras:
 
 ```bash
-uv pip install flash-attn --no-build-isolation
+# FlashAttention support (Linux + CUDA)
+uv pip install -e ".[flash]" --no-build-isolation
+
+# vLLM support (Linux + CUDA)
+uv pip install -e ".[vllm]"
+
+# Both
+uv pip install -e ".[flash,vllm]" --no-build-isolation
 ```
 
-If FlashAttention is not available, the trainers automatically fall back to PyTorch SDPA.
+## Flash Attention (Optional)
+If you have a CUDA-enabled GPU and want FlashAttention acceleration:
+
+```bash
+uv pip install -e ".[flash]" --no-build-isolation
+```
+
+RLFusion selects the fastest supported HF attention backend by default:
+- FlashAttention-3 on Hopper GPUs when a compatible FA3 backend is available
+- FlashAttention-2 on Ampere/Ada/Hopper GPUs when a compatible FA2 backend is available
+- PyTorch SDPA otherwise
+
+FlashAttention-3 is Hopper-only and requires a compatible FA3 installation. If no compatible
+FlashAttention backend is available, the trainers automatically fall back to PyTorch SDPA.
+
+You can override the automatic choice with:
+
+```bash
+export RLFUSION_ATTN_IMPLEMENTATION=sdpa
+```
 
 ## vLLM (Optional)
-To use vLLM in the `Evaluator`:
+To use vLLM:
 
 ```bash
-uv pip install vllm
+uv pip install -e ".[vllm]"
 ```
 
-Set `engine="vllm"` and optionally pass `vllm_args` (forwarded to `vllm.LLM`). RLFusion also sets
-`VLLM_ATTENTION_BACKEND=FLASH_ATTN` when the variable is unset.
+Set `engine="vllm"` in the `Evaluator` or `use_vllm=True` in the RL trainers, and optionally
+pass `vllm_args` (forwarded to `vllm.LLM`).
+
+vLLM now uses its own default attention-backend auto-selection unless you override it yourself.
+If you need to force a backend, use:
+
+```bash
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+```
 
 ## Dev Setup
 ```bash

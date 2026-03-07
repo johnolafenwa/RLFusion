@@ -32,6 +32,7 @@ accelerate launch --num_processes 2 examples/grpo_trainer_math.py
 Notes:
 - `batch_size` and `group_size` are per-process; effective sample throughput scales with `num_processes`.
 - Checkpoints and evaluation (when `eval_steps` + `eval_dataset` are set) run on the main process.
+- On compatible CUDA GPUs, RLFusion now defaults to FlashAttention automatically. Hopper prefers FA3; Ampere/Ada/Hopper otherwise prefer FA2.
 
 ## vLLM-Accelerated Generation
 
@@ -52,7 +53,7 @@ trainer = GRPOTrainer(
 
 Install vLLM first (Linux + CUDA only):
 ```bash
-pip install vllm
+uv pip install -e ".[vllm]"
 ```
 
 Parameters:
@@ -66,3 +67,4 @@ Notes:
 - Weights are automatically synced from the training model to vLLM after each optimizer step.
 - Start with `gpu_memory_utilization=0.5` and adjust based on OOM behavior.
 - `vllm_enable_sleep` adds per-step overhead but allows higher memory utilization.
+- vLLM now uses its own default attention-backend auto-selection unless you explicitly override `VLLM_ATTENTION_BACKEND`.

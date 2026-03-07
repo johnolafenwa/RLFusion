@@ -19,9 +19,11 @@ CompletionBatchWithMask = tuple[torch.Tensor, list[str], list[int], list[int], t
 
 
 def ensure_vllm_env() -> None:
-    if os.environ.get("VLLM_ATTENTION_BACKEND") is None:
-        os.environ["VLLM_ATTENTION_BACKEND"] = "FLASH_ATTN"
-        logger.info("Set VLLM_ATTENTION_BACKEND=FLASH_ATTN for vLLM.")
+    attention_backend = os.environ.get("VLLM_ATTENTION_BACKEND")
+    if attention_backend is None:
+        logger.debug("VLLM_ATTENTION_BACKEND is unset; letting vLLM auto-select an attention backend.")
+    else:
+        logger.info("Using VLLM_ATTENTION_BACKEND=%s for vLLM.", attention_backend)
 
     if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") is None:
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
