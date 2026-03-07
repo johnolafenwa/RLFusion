@@ -80,3 +80,22 @@ Notes:
 - `vllm_enable_sleep=True` can reduce peak memory pressure at the cost of per-step wake/sleep overhead.
 - `vllm_enable_sleep=True` automatically enables the underlying vLLM sleep mode.
 - If `use_accelerate=True`, keep `tensor_parallel_size=1` and `pipeline_parallel_size=1` so each process owns one local vLLM engine.
+
+FlashAttention 4:
+
+```python
+trainer = OnPolicyDistillationTrainer(
+    ...,
+    vllm_args={
+        "gpu_memory_utilization": 0.5,
+        "attention_config": {
+            "backend": "FLASH_ATTN",
+            "flash_attn_version": 4,
+        },
+    },
+)
+```
+
+Notes:
+- This requests FA4 through vLLM's `FLASH_ATTN` backend.
+- FA4 is relevant on Blackwell-class GPUs; Hopper generally uses FA3, while Ampere/Ada remain on FA2.

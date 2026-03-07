@@ -218,6 +218,10 @@ This repo's `vllm` extra standardizes on `vllm 0.17.x` plus the matching Linux T
 - With `--use-accelerate`, keep `--vllm-tensor-parallel-size 1` so each trainer process owns one local vLLM engine.
 - Use `--vllm-tensor-parallel-size > 1` only when vLLM is managing the full multi-GPU inference group by itself.
 - vLLM now uses its own default attention-backend auto-selection unless you explicitly override `VLLM_ATTENTION_BACKEND`.
+- To request FlashAttention 4 on supported Blackwell GPUs, add
+  `attention_config={"backend": "FLASH_ATTN", "flash_attn_version": 4}` to the
+  `vllm_args` dict in [reasoning_grpo_train.py](/home/jovyan/work/RLFusion/examples/reasoning/reasoning_grpo_train.py).
+- Hopper generally uses FA3; Ampere and Ada remain on FA2.
 
 ## Notes
 

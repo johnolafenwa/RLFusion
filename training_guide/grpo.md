@@ -75,3 +75,22 @@ Notes:
 - `vllm_enable_sleep` automatically enables the underlying vLLM sleep mode.
 - If `use_accelerate=True`, keep `tensor_parallel_size=1` and `pipeline_parallel_size=1` so each process owns one local vLLM engine.
 - vLLM now uses its own default attention-backend auto-selection unless you explicitly override `VLLM_ATTENTION_BACKEND`.
+
+FlashAttention 4:
+
+```python
+trainer = GRPOTrainer(
+    ...,
+    vllm_args={
+        "gpu_memory_utilization": 0.5,
+        "attention_config": {
+            "backend": "FLASH_ATTN",
+            "flash_attn_version": 4,
+        },
+    },
+)
+```
+
+Notes:
+- This requests FA4 through vLLM's `FLASH_ATTN` backend.
+- FA4 is relevant on Blackwell-class GPUs; Hopper generally uses FA3, while Ampere/Ada remain on FA2.

@@ -80,6 +80,27 @@ If you need to force a backend, use:
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 ```
 
+To request FlashAttention 4 explicitly on supported Blackwell GPUs, pass an
+`attention_config` through `vllm_args`:
+
+```python
+trainer = GRPOTrainer(
+    ...,
+    vllm_args={
+        "gpu_memory_utilization": 0.5,
+        "attention_config": {
+            "backend": "FLASH_ATTN",
+            "flash_attn_version": 4,
+        },
+    },
+)
+```
+
+Notes:
+- FA4 is a vLLM `0.17.x` feature exposed through the `FLASH_ATTN` backend.
+- In practice this matters on Blackwell-class GPUs. Hopper prefers FA3; Ampere and Ada stay on FA2.
+- If you leave `attention_config` unset, vLLM keeps its own backend/version auto-selection.
+
 ## Dev Setup
 ```bash
 uv pip install -e ".[dev,test]"
