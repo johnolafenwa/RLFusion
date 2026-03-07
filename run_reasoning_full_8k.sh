@@ -8,7 +8,7 @@ UV_BIN="${UV_BIN:-$HOME/.local/bin/uv}"
 MODEL_ID="${MODEL_ID:-Qwen/Qwen3-8B-Base}"
 MAX_LEN="${MAX_LEN:-8192}"
 OUT_DIR="${OUT_DIR:-./outputs/reasoning_full_8k_20260212}"
-USE_VLLM="${USE_VLLM:-0}"
+USE_VLLM="${USE_VLLM:-auto}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.5}"
 
 mkdir -p "$OUT_DIR/logs"
@@ -21,8 +21,11 @@ echo "out_dir=$OUT_DIR"
 
 VLLM_FLAGS=()
 if [[ "$USE_VLLM" == "1" ]]; then
-  VLLM_FLAGS+=(--use-vllm --vllm-gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION")
+  VLLM_FLAGS+=(--use-vllm)
+elif [[ "$USE_VLLM" == "0" ]]; then
+  VLLM_FLAGS+=(--no-use-vllm)
 fi
+VLLM_FLAGS+=(--vllm-gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION")
 
 "$UV_BIN" run python examples/reasoning/aime2025_evaluate.py \
   --model "$MODEL_ID" \

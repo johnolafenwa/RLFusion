@@ -33,6 +33,7 @@ def main() -> None:
         group_size=2,
         ppo_steps=1,
         max_new_tokens=64,
+        vllm_args={"gpu_memory_utilization": 0.5},
         log_completions=True,
         max_log_chars=200,
         log_level=logging.INFO,

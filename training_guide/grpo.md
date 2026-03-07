@@ -36,13 +36,14 @@ Notes:
 
 ## vLLM-Accelerated Generation
 
-Generation is the dominant bottleneck in GRPO training (80-90% of wall-clock time). Enable colocated vLLM generation for 3-5x speedup:
+Generation is the dominant bottleneck in GRPO training (80-90% of wall-clock time). On CUDA,
+`GRPOTrainer` now defaults to colocated vLLM generation for 3-5x speedup and falls back to HF
+generation on non-GPU devices:
 
 ```python
 trainer = GRPOTrainer(
     model="your-model",
     train_dataset=dataset,
-    use_vllm=True,
     vllm_args={
         "gpu_memory_utilization": 0.5,
         "tensor_parallel_size": 1,
@@ -56,15 +57,21 @@ Install vLLM first (Linux + CUDA only):
 uv pip install -e ".[vllm]"
 ```
 
+The repo-standard vLLM stack is `vllm 0.17.x` with matching Linux builds of
+`torch 2.10.x`, `torchaudio 2.10.x`, and `torchvision 0.25.x`.
+
 Parameters:
-- `use_vllm=True` — enable colocated vLLM engine for generation.
+- `use_vllm` — leave unset for the default behavior (`True` on CUDA, `False` otherwise), set
+  `False` to force HF generation, or set `True` to require vLLM explicitly.
 - `vllm_args` — dict passed to `vllm.LLM()`. Key settings:
   - `gpu_memory_utilization` (default 0.5) — fraction of GPU memory for KV cache. Lower = more memory for training.
   - `tensor_parallel_size` — number of GPUs for vLLM inference.
-- `vllm_enable_sleep=True` — put vLLM to sleep between generations to free GPU memory (requires vLLM >= 0.7).
+- `vllm_enable_sleep=True` — put vLLM to sleep between generations to free GPU memory.
 
 Notes:
 - Weights are automatically synced from the training model to vLLM after each optimizer step.
 - Start with `gpu_memory_utilization=0.5` and adjust based on OOM behavior.
 - `vllm_enable_sleep` adds per-step overhead but allows higher memory utilization.
+- `vllm_enable_sleep` automatically enables the underlying vLLM sleep mode.
+- If `use_accelerate=True`, keep `tensor_parallel_size=1` and `pipeline_parallel_size=1` so each process owns one local vLLM engine.
 - vLLM now uses its own default attention-backend auto-selection unless you explicitly override `VLLM_ATTENTION_BACKEND`.

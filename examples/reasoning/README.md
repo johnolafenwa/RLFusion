@@ -82,12 +82,13 @@ Data mapping is strict:
 - `problem` → user prompt message
 - `answer` → target answer used by reward matching
 
-**Standard (HF generation):**
+**Forced HF generation:**
 
 ```bash
 python examples/reasoning/reasoning_grpo_train.py \
   --sft-checkpoint ./outputs/reasoning/reasoning_sft/final \
   --output-dir ./outputs/reasoning/reasoning_grpo \
+  --no-use-vllm \
   --num-epochs 1 \
   --batch-size 1 \
   --group-size 4 \
@@ -104,13 +105,12 @@ python examples/reasoning/reasoning_grpo_train.py \
   --seed 42
 ```
 
-**With vLLM (3-5x faster generation):**
+**Default CUDA / vLLM path (3-5x faster generation):**
 
 ```bash
 python examples/reasoning/reasoning_grpo_train.py \
   --sft-checkpoint ./outputs/reasoning/reasoning_sft/final \
   --output-dir ./outputs/reasoning/reasoning_grpo \
-  --use-vllm \
   --vllm-gpu-memory-utilization 0.5 \
   --num-epochs 1 \
   --batch-size 1 \
@@ -127,6 +127,9 @@ python examples/reasoning/reasoning_grpo_train.py \
   --logging-steps 5 \
   --seed 42
 ```
+
+On CUDA, the script defaults to colocated vLLM generation. Add `--no-use-vllm` to force the HF
+generation path instead.
 
 KL baseline is off by default. Enable with:
 
@@ -168,9 +171,13 @@ bash run_reasoning_full_4k.sh
 # 8K context pipeline
 bash run_reasoning_full_8k.sh
 
-# With vLLM-accelerated GRPO generation
-USE_VLLM=1 bash run_reasoning_full_4k.sh
-USE_VLLM=1 VLLM_GPU_MEMORY_UTILIZATION=0.6 bash run_reasoning_full_8k.sh
+# Default auto-vLLM pipeline
+bash run_reasoning_full_4k.sh
+VLLM_GPU_MEMORY_UTILIZATION=0.6 bash run_reasoning_full_8k.sh
+
+# Force HF generation instead of vLLM
+USE_VLLM=0 bash run_reasoning_full_4k.sh
+USE_VLLM=0 bash run_reasoning_full_8k.sh
 ```
 
 ## vLLM installation
@@ -189,14 +196,17 @@ vLLM is an optional dependency used to accelerate generation during GRPO trainin
 uv pip install -e ".[vllm]"
 ```
 
+This repo's `vllm` extra standardizes on `vllm 0.17.x` plus the matching Linux Torch stack
+(`torch 2.10.x`, `torchaudio 2.10.x`, `torchvision 0.25.x`).
+
 **vLLM flags for GRPO:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--use-vllm` | off | Enable colocated vLLM engine for generation |
+| `--use-vllm` / `--no-use-vllm` | auto (`on` for CUDA, `off` otherwise) | Override the default rollout backend |
 | `--vllm-gpu-memory-utilization` | 0.5 | Fraction of GPU memory for vLLM KV cache (0-1). Lower values leave more memory for training. |
 | `--vllm-tensor-parallel-size` | 1 | Number of GPUs for tensor-parallel vLLM inference |
-| `--vllm-enable-sleep` | off | Put vLLM to sleep between generations to free GPU memory for training (requires vLLM >= 0.7) |
+| `--vllm-enable-sleep` | off | Put vLLM to sleep between generations to free GPU memory for training |
 
 **Tips:**
 
@@ -204,7 +214,9 @@ uv pip install -e ".[vllm]"
 - `--vllm-enable-sleep` adds some latency per step (wake/sleep overhead) but allows higher memory utilization since vLLM releases GPU memory during the training phase.
 - `--vllm-enable-sleep` automatically enables the underlying vLLM sleep mode.
 - vLLM weights are automatically synced from the training model after each optimizer step.
-- With `--use-accelerate`, keep `--vllm-tensor-parallel-size 1` so each trainer process uses only its local GPU(s).
+- By default, CUDA runs use vLLM and non-GPU runs fall back to HF generation.
+- With `--use-accelerate`, keep `--vllm-tensor-parallel-size 1` so each trainer process owns one local vLLM engine.
+- Use `--vllm-tensor-parallel-size > 1` only when vLLM is managing the full multi-GPU inference group by itself.
 - vLLM now uses its own default attention-backend auto-selection unless you explicitly override `VLLM_ATTENTION_BACKEND`.
 
 ## Notes

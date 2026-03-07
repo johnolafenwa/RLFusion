@@ -35,6 +35,7 @@ def main() -> None:
         ppo_steps=1,
         clip_eps=0.2,
         max_new_tokens=64,
+        vllm_args={"gpu_memory_utilization": 0.5},
         max_grad_norm=1.0,
         log_completions=True,
         max_log_chars=200,

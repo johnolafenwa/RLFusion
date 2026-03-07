@@ -14,6 +14,9 @@ from rlfusion.envs import EnvBase
 
 logger = logging.getLogger(__name__)
 _APPLY_MODEL_SYNC_LOGGED = False
+DEFAULT_COLOCATED_VLLM_ARGS: dict[str, Any] = {
+    "gpu_memory_utilization": 0.5,
+}
 
 CompletionBatch = tuple[torch.Tensor, list[str], list[int], list[int]]
 CompletionBatchWithMask = tuple[torch.Tensor, list[str], list[int], list[int], torch.Tensor]
@@ -86,6 +89,38 @@ def prepare_vllm_runtime_args(
         resolved["enable_sleep_mode"] = True
 
     return resolved
+
+
+def resolve_vllm_training_config(
+    *,
+    device: str,
+    use_vllm: bool | None,
+    vllm_args: dict[str, Any] | None,
+    enable_sleep: bool,
+    use_accelerate: bool,
+) -> tuple[bool, dict[str, Any], bool]:
+    auto_selected = use_vllm is None
+    resolved_use_vllm = device == "cuda" if auto_selected else use_vllm
+
+    if not resolved_use_vllm:
+        return False, {}, auto_selected
+
+    if device != "cuda":
+        raise ValueError("use_vllm requires a CUDA device. Pass use_vllm=False on non-GPU devices.")
+
+    merged_args = dict(DEFAULT_COLOCATED_VLLM_ARGS)
+    if vllm_args is not None:
+        merged_args.update(vllm_args)
+
+    return (
+        True,
+        prepare_vllm_runtime_args(
+            merged_args,
+            enable_sleep=enable_sleep,
+            use_accelerate=use_accelerate,
+        ),
+        auto_selected,
+    )
 
 
 def build_sampling_params(
@@ -243,9 +278,9 @@ def sync_model_weights_to_vllm(model: Any, vllm_engine: Any) -> None:
     """Copy training model weights into a colocated vLLM engine.
 
     Handles DDP / Accelerate wrappers by unwrapping via ``.module``.
-    Prefers ``llm.load_weights()`` (vLLM >= 0.7), falling back to the
+    Prefers the public ``llm.load_weights()`` API, falling back to the
     legacy internal model executor path, then the current ``apply_model``
-    worker hook used by recent vLLM releases.
+    worker hook used by the standardized `vllm 0.17.x` path.
     """
     global _APPLY_MODEL_SYNC_LOGGED
     unwrapped = model.module if hasattr(model, "module") else model
@@ -253,7 +288,7 @@ def sync_model_weights_to_vllm(model: Any, vllm_engine: Any) -> None:
     # Collect (name, tensor) pairs
     weight_pairs = [(name, param.detach()) for name, param in unwrapped.named_parameters()]
 
-    # vLLM >= 0.7 exposes load_weights() directly on the LLM object
+    # Current vLLM releases expose load_weights() directly on the LLM object.
     if hasattr(vllm_engine, "load_weights"):
         vllm_engine.load_weights(weight_pairs)
         logger.info("Synced %d parameter tensors to vLLM via load_weights().", len(weight_pairs))
@@ -303,8 +338,8 @@ def sync_model_weights_to_vllm(model: Any, vllm_engine: Any) -> None:
 def vllm_sleep(vllm_engine: Any, level: int = 2) -> None:
     """Put the vLLM engine to sleep to free GPU memory for training.
 
-    Requires vLLM >= 0.7 with ``--enable-sleep-mode``.  No-op if the API
-    is unavailable.
+    Requires the engine to be created with sleep mode enabled. No-op if the
+    API is unavailable.
     """
     if hasattr(vllm_engine, "sleep"):
         vllm_engine.sleep(level=level)

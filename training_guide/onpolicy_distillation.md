@@ -48,14 +48,14 @@ Notes:
 
 ## vLLM-Accelerated Generation
 
-On-policy distillation also supports colocated vLLM generation through `use_vllm=True`.
+On CUDA, `OnPolicyDistillationTrainer` now defaults to colocated vLLM generation and falls back
+to HF generation on non-GPU devices.
 
 ```python
 trainer = OnPolicyDistillationTrainer(
     model="your-student-model",
     teacher_model="your-teacher-model",
     train_dataset=dataset,
-    use_vllm=True,
     vllm_args={
         "gpu_memory_utilization": 0.5,
         "tensor_parallel_size": 1,
@@ -70,6 +70,13 @@ Install vLLM first (Linux + CUDA only):
 uv pip install -e ".[vllm]"
 ```
 
+The repo-standard vLLM stack is `vllm 0.17.x` with matching Linux builds of
+`torch 2.10.x`, `torchaudio 2.10.x`, and `torchvision 0.25.x`.
+
 Notes:
+- Weights are automatically synced from the training model to vLLM after each optimizer step.
+- Set `use_vllm=False` to force HF generation, or `use_vllm=True` to require vLLM explicitly.
 - vLLM now uses its own default attention-backend auto-selection unless you explicitly override `VLLM_ATTENTION_BACKEND`.
 - `vllm_enable_sleep=True` can reduce peak memory pressure at the cost of per-step wake/sleep overhead.
+- `vllm_enable_sleep=True` automatically enables the underlying vLLM sleep mode.
+- If `use_accelerate=True`, keep `tensor_parallel_size=1` and `pipeline_parallel_size=1` so each process owns one local vLLM engine.

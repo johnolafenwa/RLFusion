@@ -15,7 +15,7 @@ SFT_TRAIN_MAX_SAMPLES="${SFT_TRAIN_MAX_SAMPLES:-10000}"
 OUT_DIR="${OUT_DIR:-./outputs/reasoning_full_4k_20260212}"
 SKIP_BASE_EVAL="${SKIP_BASE_EVAL:-0}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-}"
-USE_VLLM="${USE_VLLM:-0}"
+USE_VLLM="${USE_VLLM:-auto}"
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.5}"
 
 mkdir -p "$OUT_DIR/logs"
@@ -45,8 +45,11 @@ fi
 
 VLLM_FLAGS=()
 if [[ "$USE_VLLM" == "1" ]]; then
-  VLLM_FLAGS+=(--use-vllm --vllm-gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION")
+  VLLM_FLAGS+=(--use-vllm)
+elif [[ "$USE_VLLM" == "0" ]]; then
+  VLLM_FLAGS+=(--no-use-vllm)
 fi
+VLLM_FLAGS+=(--vllm-gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION")
 
 if [[ "$SKIP_BASE_EVAL" != "1" ]]; then
   "$UV_BIN" run python examples/reasoning/aime2025_evaluate.py \

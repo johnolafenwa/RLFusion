@@ -7,6 +7,7 @@ from rlfusion.envs import EnvBase
 from rlfusion.inference.vllm_utils import (
     ensure_vllm_env,
     prepare_vllm_runtime_args,
+    resolve_vllm_training_config,
     sample_completions_batch_vllm,
     sync_model_weights_to_vllm,
 )
@@ -133,6 +134,45 @@ def test_prepare_vllm_runtime_args_rejects_multi_gpu_vllm_with_accelerate():
             {"tensor_parallel_size": 2},
             enable_sleep=False,
             use_accelerate=True,
+        )
+
+
+def test_resolve_vllm_training_config_defaults_to_vllm_on_cuda():
+    use_vllm, resolved_args, auto_selected = resolve_vllm_training_config(
+        device="cuda",
+        use_vllm=None,
+        vllm_args=None,
+        enable_sleep=False,
+        use_accelerate=False,
+    )
+
+    assert use_vllm is True
+    assert auto_selected is True
+    assert resolved_args["gpu_memory_utilization"] == 0.5
+
+
+def test_resolve_vllm_training_config_defaults_to_hf_on_cpu():
+    use_vllm, resolved_args, auto_selected = resolve_vllm_training_config(
+        device="cpu",
+        use_vllm=None,
+        vllm_args={"gpu_memory_utilization": 0.3},
+        enable_sleep=False,
+        use_accelerate=False,
+    )
+
+    assert use_vllm is False
+    assert auto_selected is True
+    assert resolved_args == {}
+
+
+def test_resolve_vllm_training_config_rejects_non_cuda_vllm():
+    with pytest.raises(ValueError, match="requires a CUDA device"):
+        resolve_vllm_training_config(
+            device="cpu",
+            use_vllm=True,
+            vllm_args=None,
+            enable_sleep=False,
+            use_accelerate=False,
         )
 
 

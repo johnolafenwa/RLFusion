@@ -28,7 +28,7 @@ from rlfusion.inference.hf_utils import sample_completions_batch_hf
 from rlfusion.inference.vllm_utils import (
     build_sampling_params,
     load_vllm_engine,
-    prepare_vllm_runtime_args,
+    resolve_vllm_training_config,
     sample_completions_batch_vllm,
     sync_model_weights_to_vllm,
     vllm_sleep,
@@ -134,7 +134,7 @@ class OnPolicyDistillationTrainer:
         max_grad_norm: Optional[float] = None,
         log_level: int = logging.INFO,
         use_accelerate: bool = False,
-        use_vllm: bool = False,
+        use_vllm: bool | None = None,
         vllm_args: Optional[dict[str, Any]] = None,
         vllm_enable_sleep: bool = False,
     ):
@@ -182,6 +182,24 @@ class OnPolicyDistillationTrainer:
         self.eval_dataset = eval_dataset
 
         device = get_device()
+        resolved_use_vllm, resolved_vllm_args, auto_selected_vllm = resolve_vllm_training_config(
+            device=device,
+            use_vllm=use_vllm,
+            vllm_args=vllm_args,
+            enable_sleep=vllm_enable_sleep,
+            use_accelerate=use_accelerate,
+        )
+        if auto_selected_vllm:
+            if resolved_use_vllm:
+                logger.info(
+                    "CUDA detected; defaulting on-policy distillation rollouts to colocated vLLM "
+                    "with args=%s.",
+                    resolved_vllm_args,
+                )
+            else:
+                logger.info(
+                    "Non-CUDA device detected; defaulting on-policy distillation rollouts to HF generation."
+                )
         if device == "cuda":
             if self.accelerator is None:
                 device_map: str | dict[str, int] = "auto"
@@ -255,8 +273,8 @@ class OnPolicyDistillationTrainer:
                         "ppo_steps": ppo_steps,
                         "clip_eps": clip_eps,
                         "use_eval_dataset": eval_dataset is not None,
-                        "use_vllm": use_vllm,
-                        "vllm_args": vllm_args,
+                        "use_vllm": resolved_use_vllm,
+                        "vllm_args": resolved_vllm_args or None,
                         "vllm_enable_sleep": vllm_enable_sleep,
                     },
                 )
@@ -287,22 +305,24 @@ class OnPolicyDistillationTrainer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # vLLM colocated generation
-        self.use_vllm = use_vllm
+        self.use_vllm = resolved_use_vllm
         self.vllm_enable_sleep = vllm_enable_sleep
         self._vllm_engine: Any = None
         self._vllm_sampling_params_cls: Any = None
         self._vllm_sampling_param_keys: Any = None
-        resolved_vllm_args = {}
-        if use_vllm:
-            resolved_vllm_args = prepare_vllm_runtime_args(
-                vllm_args,
-                enable_sleep=vllm_enable_sleep,
-                use_accelerate=use_accelerate,
-            )
-        if use_vllm:
-            self._vllm_engine, self._vllm_sampling_params_cls, self._vllm_sampling_param_keys = (
-                load_vllm_engine(model, resolved_vllm_args)
-            )
+        if self.use_vllm:
+            try:
+                self._vllm_engine, self._vllm_sampling_params_cls, self._vllm_sampling_param_keys = (
+                    load_vllm_engine(model, resolved_vllm_args)
+                )
+            except ImportError as exc:
+                if auto_selected_vllm:
+                    raise ImportError(
+                        "OnPolicyDistillationTrainer defaults to vLLM on CUDA. Install the `vllm` "
+                        "extra with `uv pip install -e \".[vllm]\"` or pass use_vllm=False to "
+                        "force HF generation."
+                    ) from exc
+                raise
             sync_model_weights_to_vllm(self.model, self._vllm_engine)
             logger.info("vLLM colocated engine initialized for generation.")
 
