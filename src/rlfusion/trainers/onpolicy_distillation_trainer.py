@@ -358,6 +358,14 @@ class OnPolicyDistillationTrainer:
     def _unwrap_model_for_saving(self) -> torch.nn.Module:
         return unwrap_model_for_saving(self.model, self.accelerator)
 
+    def _sync_skip_flag(self, local_skip: bool) -> bool:
+        if self.accelerator is None:
+            return local_skip
+        model_device = next(self.model.parameters()).device
+        skip_tensor = torch.tensor(float(local_skip), device=model_device)
+        skip_tensor = self.accelerator.reduce(skip_tensor, reduction="max")
+        return bool(skip_tensor.item() > 0)
+
     def _validate_teacher_tokenizer_compatibility(self, teacher_model: str) -> None:
         teacher_kwargs = get_tokenizer_compat_kwargs(teacher_model)
         teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model, **teacher_kwargs)
@@ -700,15 +708,60 @@ class OnPolicyDistillationTrainer:
                 sequences,
                 full_attention_mask=full_attention_mask,
             )
+            if self._sync_skip_flag(
+                (not torch.isfinite(old_log_probs).all().item())
+                or (not torch.isfinite(teacher_log_probs).all().item())
+                or (not torch.isfinite(masks).all().item())
+            ):
+                logger.warning(
+                    "step %d skipping distillation batch because sampled log-probs or masks contained non-finite values.",
+                    step + 1,
+                )
+                continue
             mask_counts = masks.sum(dim=1).clamp_min(1.0)
             reverse_kl = (old_log_probs - teacher_log_probs) * masks
             # Use negative reverse KL as an advantage signal to pull toward the teacher.
             advantages = -reverse_kl
+            if self._sync_skip_flag(
+                (not torch.isfinite(reverse_kl).all().item())
+                or (not torch.isfinite(advantages).all().item())
+            ):
+                logger.warning(
+                    "step %d skipping distillation batch because reverse KL or advantages became non-finite.",
+                    step + 1,
+                )
+                continue
 
             loss = None
+            skipped_update = False
             for ppo_step in range(self.ppo_steps):
+                _ = ppo_step
                 self.optimizer.zero_grad(set_to_none=True)
                 new_log_probs = self.get_log_probs(sequences, attention_mask=full_attention_mask)
+                local_nonfinite = not torch.isfinite(new_log_probs).all().item()
+                if not local_nonfinite:
+                    loss_per = self._ppo_loss(
+                        old_log_probs,
+                        new_log_probs,
+                        advantages,
+                        masks,
+                        clip_eps=self.clip_eps,
+                    )
+                    loss = loss_per.mean()
+                    local_nonfinite = (not torch.isfinite(loss_per).all().item()) or (
+                        not torch.isfinite(loss).item()
+                    )
+                else:
+                    loss = None
+
+                if self._sync_skip_flag(local_nonfinite):
+                    logger.warning(
+                        "step %d skipping distillation update because PPO log-probs or loss became non-finite.",
+                        step + 1,
+                    )
+                    skipped_update = True
+                    break
+
                 loss_per = self._ppo_loss(
                     old_log_probs,
                     new_log_probs,
@@ -716,7 +769,6 @@ class OnPolicyDistillationTrainer:
                     masks,
                     clip_eps=self.clip_eps,
                 )
-                loss = loss_per.mean()
                 if self.accelerator is None:
                     loss.backward()
                 else:
@@ -728,6 +780,9 @@ class OnPolicyDistillationTrainer:
                     self._vllm_dirty = True
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
+
+            if skipped_update:
+                continue
 
             reverse_kl_mean = float((reverse_kl.sum(dim=1) / mask_counts).mean().item())
 
@@ -858,20 +913,48 @@ class OnPolicyDistillationTrainer:
                 mask_counts = masks.sum(dim=1).clamp_min(1.0)
                 reverse_kl = (student_log_probs - teacher_log_probs) * masks
                 loss_per = reverse_kl.sum(dim=1) / mask_counts
+                valid_rows = torch.isfinite(loss_per) & torch.isfinite(mask_counts)
+                if not bool(valid_rows.any().item()):
+                    logger.warning("eval batch produced non-finite reverse KL for every sample; skipping batch.")
+                    continue
+                if not bool(valid_rows.all().item()):
+                    logger.warning(
+                        "eval batch dropped %d sample(s) with non-finite reverse KL before aggregation.",
+                        int((~valid_rows).sum().item()),
+                    )
+                valid_indices = [idx for idx, ok in enumerate(valid_rows.tolist()) if ok]
 
-                all_loss.extend(loss_per.detach().cpu().tolist())
-                all_mask_counts.extend(mask_counts.detach().cpu().tolist())
-                all_completion_lengths.extend(completion_lens)
+                all_loss.extend(loss_per[valid_rows].detach().cpu().tolist())
+                all_mask_counts.extend(mask_counts[valid_rows].detach().cpu().tolist())
+                all_completion_lengths.extend([completion_lens[idx] for idx in valid_indices])
 
                 rewards = [
                     self._compute_reward(env, completion)
                     for env, completion in zip(env_batch, texts)
                 ]
-                all_rewards.extend([r for r in rewards if r is not None])
+                all_rewards.extend(
+                    [rewards[idx] for idx in valid_indices if rewards[idx] is not None]
+                )
 
                 if first_batch_completions is None:
-                    first_batch_completions = texts
-                    first_batch_env = env_batch[0]
+                    first_batch_completions = [texts[idx] for idx in valid_indices]
+                    first_batch_env = env_batch[valid_indices[0]]
+
+            if not all_loss:
+                logger.warning("All eval batches produced non-finite reverse KL.")
+                loss_mean = float("nan")
+                reward_mean = None
+                reward_std = None
+                mask_tokens_mean = float("nan")
+                completion_tokens_mean = float("nan")
+                return {
+                    "loss": loss_mean,
+                    "reverse_kl": loss_mean,
+                    "reward_mean": reward_mean,
+                    "reward_std": reward_std,
+                    "mask_tokens_mean": mask_tokens_mean,
+                    "completion_tokens_mean": completion_tokens_mean,
+                }
 
             loss_tensor = torch.tensor(all_loss, dtype=torch.float32)
             loss_mean = float(loss_tensor.mean().item())
