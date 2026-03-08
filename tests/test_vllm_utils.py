@@ -7,6 +7,7 @@ import rlfusion.inference.vllm_utils as vllm_utils
 from rlfusion.envs import EnvBase
 from rlfusion.inference.vllm_utils import (
     _build_ipc_weight_update_info,
+    build_sampling_params,
     ensure_vllm_env,
     pin_vllm_to_local_cuda_device,
     prepare_vllm_runtime_args,
@@ -25,11 +26,17 @@ class _DummyEnv(EnvBase):
 class _FakeTokenizer:
     pad_token_id = 0
     eos_token_id = 2
+    im_end_token_id = 3
 
     def apply_chat_template(self, prompt, add_generation_prompt=True, tokenize=False):
         assert add_generation_prompt is True
         assert tokenize is False
         return str(prompt)
+
+    def convert_tokens_to_ids(self, token):
+        if token == "<|im_end|>":
+            return self.im_end_token_id
+        return -1
 
     def decode(self, token_ids, skip_special_tokens=True):
         assert skip_special_tokens is True
@@ -54,7 +61,7 @@ class _FakeEngine:
     def generate(self, prompts, sampling_params):
         _ = (prompts, sampling_params)
         return [
-            _FakeRequestOutput([11, 12, 13], [7, 2, 9]),
+            _FakeRequestOutput([11, 12, 13], [7, 3, 9]),
             _FakeRequestOutput([21, 22, 23, 24, 25], [8, 8, 2]),
         ]
 
@@ -80,7 +87,7 @@ def test_sample_completions_batch_vllm_returns_full_attention_mask():
     assert completion_lengths == [1, 2]
     expected_sequences = torch.tensor(
         [
-            [0, 0, 11, 12, 13, 7, 2, 9],
+            [0, 0, 11, 12, 13, 7, 3, 9],
             [21, 22, 23, 24, 25, 8, 8, 2],
         ],
         dtype=torch.long,
@@ -95,6 +102,26 @@ def test_sample_completions_batch_vllm_returns_full_attention_mask():
 
     assert torch.equal(sequences, expected_sequences)
     assert torch.equal(attention_mask, expected_attention_mask)
+
+
+def test_build_sampling_params_adds_chat_stop_token_ids():
+    captured = {}
+
+    class _SamplingParams:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    build_sampling_params(
+        _SamplingParams,
+        {"max_tokens", "temperature", "stop_token_ids"},
+        tokenizer=_FakeTokenizer(),
+        generation_args={},
+        max_new_tokens=16,
+        do_sample=False,
+        temperature=0.7,
+    )
+
+    assert captured["stop_token_ids"] == [2, 3]
 
 
 def test_ensure_vllm_env_preserves_backend_autoselection(monkeypatch):

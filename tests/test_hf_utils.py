@@ -10,6 +10,7 @@ class _DummyTokenizer:
         self.padding_side_seen: str | None = None
         self.pad_token_id = 0
         self.eos_token_id = 2
+        self.im_end_token_id = 3
 
     def apply_chat_template(
         self, prompt: list[dict[str, object]], add_generation_prompt: bool, tokenize: bool
@@ -22,10 +23,20 @@ class _DummyTokenizer:
         assert return_tensors == "pt"
         assert padding is True
         self.padding_side_seen = self.padding_side
+        if len(prompts) == 1:
+            return {
+                "input_ids": torch.tensor([[11, 12]], dtype=torch.long),
+                "attention_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            }
         return {
             "input_ids": torch.tensor([[0, 11, 12], [21, 22, 23]], dtype=torch.long),
             "attention_mask": torch.tensor([[0, 1, 1], [1, 1, 1]], dtype=torch.long),
         }
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        if token == "<|im_end|>":
+            return self.im_end_token_id
+        return -1
 
     def decode(self, token_ids: torch.Tensor, skip_special_tokens: bool = True) -> str:
         assert skip_special_tokens is True
@@ -133,3 +144,37 @@ def test_sample_completions_batch_hf_allows_generation_temperature_override():
     assert model.last_generate_kwargs is not None
     assert model.last_generate_kwargs["temperature"] == 0.3
     assert model.last_generate_kwargs["use_cache"] is True
+
+
+def test_sample_completions_batch_hf_stops_on_chat_end_token():
+    tokenizer = _DummyTokenizer()
+    model = _DummyModel()
+    envs = [_DummyEnv(prompt=[{"role": "user", "content": "short"}], answer="x")]
+
+    def _generate(**kwargs):
+        model.last_generate_kwargs = kwargs
+        input_ids = kwargs["input_ids"]
+        completion = torch.tensor(
+            [[7, tokenizer.im_end_token_id, 9]] * input_ids.shape[0],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        return _DummyGenerateOutput(torch.cat([input_ids, completion], dim=1))
+
+    model.generate = _generate
+
+    _, texts, _, completion_lengths = sample_completions_batch_hf(
+        model=model,
+        tokenizer=tokenizer,
+        envs=envs,
+        do_sample=False,
+        sampling_temperature=1.0,
+        max_new_tokens=3,
+        generation_args={},
+        return_attention_mask=False,
+    )
+
+    assert texts == ["decoded"]
+    assert completion_lengths == [1]
+    assert model.last_generate_kwargs is not None
+    assert model.last_generate_kwargs["eos_token_id"] == [2, 3]

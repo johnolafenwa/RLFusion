@@ -13,6 +13,39 @@ CompletionBatch = tuple[TokenIds, list[str], list[int], list[int]]
 CompletionBatchWithMask = tuple[TokenIds, list[str], list[int], list[int], AttentionMask]
 
 
+def _resolve_chat_stop_token_ids(tokenizer: Any) -> list[int]:
+    stop_token_ids: list[int] = []
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(eos_token_id, int) and eos_token_id >= 0:
+        stop_token_ids.append(eos_token_id)
+
+    convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert_tokens_to_ids):
+        im_end_token_id = convert_tokens_to_ids("<|im_end|>")
+        if isinstance(im_end_token_id, int) and im_end_token_id >= 0 and im_end_token_id not in stop_token_ids:
+            stop_token_ids.append(im_end_token_id)
+
+    return stop_token_ids
+
+
+def _merge_stop_token_ids(existing: Any, defaults: list[int]) -> list[int]:
+    stop_token_ids: list[int] = []
+
+    def _extend(value: Any) -> None:
+        if isinstance(value, int):
+            if value >= 0 and value not in stop_token_ids:
+                stop_token_ids.append(value)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                if isinstance(item, int) and item >= 0 and item not in stop_token_ids:
+                    stop_token_ids.append(item)
+
+    _extend(existing)
+    _extend(defaults)
+    return stop_token_ids
+
+
 @overload
 def sample_completions_batch_hf(
     *,
@@ -92,6 +125,12 @@ def sample_completions_batch_hf(
         gen_kwargs["temperature"] = sampling_temperature
     if generation_args:
         gen_kwargs.update(generation_args)
+    stop_token_ids = _merge_stop_token_ids(
+        gen_kwargs.get("eos_token_id"),
+        _resolve_chat_stop_token_ids(tokenizer),
+    )
+    if stop_token_ids:
+        gen_kwargs["eos_token_id"] = stop_token_ids[0] if len(stop_token_ids) == 1 else stop_token_ids
     gen_kwargs["return_dict_in_generate"] = True
 
     with torch.no_grad():
@@ -100,7 +139,7 @@ def sample_completions_batch_hf(
     generated_sequences = outputs.sequences
     ret_texts: list[str] = []
     completion_lengths: list[int] = []
-    eos_token_id = tokenizer.eos_token_id
+    stop_token_ids = _resolve_chat_stop_token_ids(tokenizer)
     pad_token_id = tokenizer.pad_token_id
 
     input_length = int(input_ids.shape[1])
@@ -109,10 +148,10 @@ def sample_completions_batch_hf(
         generated_token_ids = output_token_ids[input_length:]
         end_offset = generated_token_ids.shape[0]
 
-        if eos_token_id is not None:
-            eos_positions = (generated_token_ids == eos_token_id).nonzero(as_tuple=True)[0]
-            if eos_positions.numel() > 0:
-                end_offset = min(end_offset, int(eos_positions[0]))
+        for stop_token_id in stop_token_ids:
+            stop_positions = (generated_token_ids == stop_token_id).nonzero(as_tuple=True)[0]
+            if stop_positions.numel() > 0:
+                end_offset = min(end_offset, int(stop_positions[0]))
 
         if pad_token_id is not None:
             pad_positions = (generated_token_ids == pad_token_id).nonzero(as_tuple=True)[0]

@@ -2,8 +2,8 @@
 
 This folder provides an end-to-end flow:
 
-1. SFT on `johnolafenwa/reasoning-sft` (`train` / `test` splits)
-2. GRPO on `johnolafenwa/reasoning-rl` using the SFT checkpoint
+1. SFT on `johnolafenwa/highschool-math-reasoning` (`train` / `test` splits)
+2. GRPO on `johnolafenwa/highschool-math-reasoning-rl` using the SFT checkpoint
 3. AIME2025 evaluation on base/SFT/GRPO checkpoints
 
 Scripts:
@@ -23,25 +23,31 @@ uv pip install -e .
 Optional accelerators:
 
 ```bash
-# HF FlashAttention + Liger + bitsandbytes
+# HF Liger + bitsandbytes
 uv sync --extra gpu-train --extra dev --extra test
+
+# Optional HF FlashAttention backend
+uv sync --extra gpu-train --extra flash --extra dev --extra test
 
 # vLLM support for RL generation
 uv sync --extra vllm
 
-# Full validated CUDA stack
+# Full validated CUDA stack without FlashAttention
 uv sync --extra gpu-train --extra vllm --extra dev --extra test
+
+# Full validated CUDA stack with FlashAttention added explicitly
+uv sync --extra gpu-train --extra flash --extra vllm --extra dev --extra test
 ```
 
-`reasoning_sft_train.py` uses native splits from `johnolafenwa/reasoning-sft`:
+`reasoning_sft_train.py` uses native splits from `johnolafenwa/highschool-math-reasoning`:
 
 - `train` for training
 - `test` for evaluation
 
 Data mapping is strict:
 
-- `input` → user prompt message
-- `output` → assistant target message
+- `messages` → full chat transcript used directly for SFT
+- `answer` → retained in the dataset but not used by the SFT trainer because the target assistant turn is already embedded in `messages`
 
 ```bash
 python /Users/johnolafenwa/source/rlfusion/RLFusion/examples/reasoning/reasoning_sft_train.py \
@@ -65,25 +71,26 @@ Tips:
 - `save_final_only` defaults to `True`, so the run saves only the `final` checkpoint.
 - Pass `--no-save-final-only` if you need intermediate `step_<N>` checkpoints.
 
-## 2) GRPO on reasoning-rl
+## 2) GRPO on highschool-math-reasoning-rl
 
 `reasoning_grpo_train.py` starts from SFT checkpoint and applies reward that requires **all**:
 
-1. response starts with `<think>` (case-sensitive)
-2. includes `</think>`
-3. non-empty `<think>...</think>` content
-4. `\boxed{...}` exists in text after `</think>`
-5. boxed answer exactly equals dataset answer (`get_boxed_answer(... )` match, case-sensitive)
+1. exactly one top-level `<think>...</think>` block
+2. non-empty content inside that think block
+3. exactly one terminal `\boxed{...}` answer after `</think>`
+4. zero reward if the format contract is violated anywhere
+5. boxed answer correctness checked with `math-verify` instead of raw string equality
 
-Dataset uses native splits from `johnolafenwa/reasoning-rl`:
+Dataset uses native splits from `johnolafenwa/highschool-math-reasoning-rl`:
 
 - `train` for GRPO updates
 - `test` for periodic evaluation
 
 Data mapping is strict:
 
-- `problem` → user prompt message
-- `answer` → target answer used by reward matching
+- `messages[:-1]` → prompt turns used for rollout, with the format instruction appended to the final user turn
+- `messages[-1]` → held-out assistant example, not shown to the policy during GRPO
+- `answer` → target answer used by `math-verify` reward matching
 
 **Forced HF generation:**
 

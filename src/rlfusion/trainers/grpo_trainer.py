@@ -387,6 +387,7 @@ class GRPOTrainer():
         return build_sampling_params(
             self._vllm_sampling_params_cls,
             self._vllm_sampling_param_keys,
+            tokenizer=self.tokenizer,
             generation_args=self.generation_args,
             max_new_tokens=self.max_new_tokens,
             do_sample=True,

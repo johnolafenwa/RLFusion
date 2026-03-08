@@ -23,14 +23,20 @@ Optional extras:
 
 ```bash
 # Repo-standard HF CUDA training stack:
-# FlashAttention + Liger + bitsandbytes/AdamW8bit
-uv pip install -e ".[gpu-train]" --no-build-isolation
+# Liger + bitsandbytes/AdamW8bit only
+uv pip install -e ".[gpu-train]"
+
+# Optional HF FlashAttention backend (Linux; may build from source)
+uv pip install -e ".[flash]" --no-build-isolation
 
 # vLLM support (Linux + CUDA)
 uv pip install -e ".[vllm]"
 
-# Full validated stack
+# Full validated stack without FlashAttention
 uv sync --extra gpu-train --extra vllm --extra dev --extra test
+
+# Full validated stack with FlashAttention added explicitly
+uv sync --extra gpu-train --extra flash --extra vllm --extra dev --extra test
 ```
 
 ## HF CUDA Training Stack (Optional)
@@ -41,21 +47,26 @@ uv sync --extra gpu-train --extra vllm --extra dev --extra test
 ```
 
 This installs:
-- `flash-attn` for HF FlashAttention
 - `liger-kernel` so HF trainers automatically use the Liger model wrappers when available
 - `bitsandbytes` for memory-efficient optimizers such as `AdamW8bit`
 
-RLFusion selects the fastest supported HF attention backend by default on CUDA:
+If you also want HF FlashAttention, install it separately:
+
+```bash
+uv sync --extra gpu-train --extra flash --extra vllm --extra dev --extra test
+```
+
+When `flash-attn` is installed, RLFusion selects the fastest supported HF attention backend by default on CUDA:
 - FlashAttention-3 on Hopper GPUs when a compatible FA3 backend is available
 - FlashAttention-2 on Ampere/Ada/Hopper GPUs when a compatible FA2 backend is available
 - PyTorch SDPA otherwise
 
 FlashAttention-3 is Hopper-only and requires a compatible FA3 installation. If no compatible
-FlashAttention backend is available, the trainers automatically fall back to PyTorch SDPA. When
+FlashAttention backend is installed, the trainers automatically fall back to PyTorch SDPA. When
 `liger-kernel` is installed, the HF trainers also switch to the Liger-backed model classes
 automatically.
 
-Current stack caveat:
+Optional FlashAttention caveat:
 - The repo-standard `vllm 0.17.x` stack pins `torch 2.10.x`.
 - Upstream `flash-attn 2.8.3` does not publish a matching wheel for every `torch 2.10` platform,
   so Linux installs may compile `flash-attn` from source on first install.
@@ -83,11 +94,12 @@ forwarded to `vllm.LLM`.
 Notes:
 - The repo standardizes on `vllm 0.17.x` on Linux, with a matching `torch 2.10.x` /
   `torchaudio 2.10.x` / `torchvision 0.25.x` stack from the `vllm` extra.
-- For HF FlashAttention + Liger + `AdamW8bit` on the same stack, install the `gpu-train` extra:
+- For Liger + `AdamW8bit` on the same stack, install the `gpu-train` extra:
 
   ```bash
   uv sync --extra gpu-train --extra vllm --extra dev --extra test
   ```
+- Add `--extra flash` only if you explicitly want HF FlashAttention on top of that stack.
 - `vllm_enable_sleep=True` automatically enables the underlying vLLM sleep mode.
 - When combining `use_accelerate=True` with `use_vllm=True`, keep
   `tensor_parallel_size=1` and `pipeline_parallel_size=1` so each trainer process owns exactly one
@@ -286,6 +298,7 @@ Notes:
 - On-policy distillation: `training_guide/onpolicy_distillation.md`
 - Reasoning pipeline (dataset-specific): `examples/reasoning/README.md`
 - Qwen3 reasoning SFT on `johnolafenwa/reasoning-sft`: `examples/sft_qwen3_4b_instruct_2507_reasoning.py`
+- Qwen3-8B-Base reasoning SFT on `johnolafenwa/highschool-math-reasoning`: `examples/reasoning/reasoning_sft_train.py`
 - Qwen3 reasoning GRPO from that SFT checkpoint: `examples/grpo_qwen3_4b_instruct_2507.py`
 - Qwen3 base-model inference probe: `examples/qwen3_4b_instruct_2507_inference.py`
 

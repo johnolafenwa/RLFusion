@@ -1,16 +1,14 @@
-"""SFT on johnolafenwa/reasoning-sft using native train/test splits."""
+"""SFT on johnolafenwa/highschool-math-reasoning using native train/test splits."""
 
 from __future__ import annotations
 
 import argparse
 import logging
 import math
-from dataclasses import dataclass
-from typing import Optional
 
-from torch.utils.data import Dataset
+from torch.optim import AdamW
 
-from rlfusion.envs import EnvBase
+from rlfusion.datasets import HighSchoolMathReasoningSFTDataset
 from rlfusion.trainers import SFTTrainer
 
 
@@ -21,56 +19,19 @@ def _unwrap_model(model: object) -> object:
     return model.module if hasattr(model, "module") else model
 
 
-@dataclass
-class ReasoningSFTEnv(EnvBase):
-    def get_reward(self, prediction: str | None) -> float:
-        return 0.0
-
-
-class ReasoningSFTDataset(Dataset):
-    """Adapter for johnolafenwa/reasoning-sft input/output rows."""
-
-    def __init__(
-        self,
-        split: str,
-        max_samples: Optional[int] = None,
-        seed: Optional[int] = None,
-    ) -> None:
-        try:
-            from datasets import load_dataset
-        except ImportError as exc:
-            raise ImportError(
-                "datasets is required for ReasoningSFTDataset. Install with: uv pip install datasets"
-            ) from exc
-
-        if split not in {"train", "test"}:
-            raise ValueError("split must be 'train' or 'test'.")
-
-        dataset = load_dataset("johnolafenwa/reasoning-sft", split=split)
-        if seed is not None:
-            dataset = dataset.shuffle(seed=seed)
-        if max_samples is not None:
-            dataset = dataset.select(range(min(max_samples, len(dataset))))
-
-        self.dataset = dataset
-
-    def __len__(self) -> int:
-        return len(self.dataset)
-
-
-    def __getitem__(self, index: int) -> ReasoningSFTEnv:
-        row = self.dataset[index]
-        user_input = row.get("input")
-        assistant_output = row.get("output")
-        prompt = [{"role": "user", "content": user_input}]
-        answer = assistant_output
-
-        return ReasoningSFTEnv(prompt=prompt, answer=answer)
+def _get_adamw8bit() -> object:
+    try:
+        from bitsandbytes.optim import AdamW8bit
+    except ImportError as exc:
+        raise ImportError(
+            "bitsandbytes is required for AdamW8bit. Install with: uv sync --extra gpu-train --extra vllm --extra dev --extra test"
+        ) from exc
+    return AdamW8bit
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train SFT on johnolafenwa/reasoning-sft."
+        description="Train SFT on johnolafenwa/highschool-math-reasoning."
     )
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-8B-Base")
     parser.add_argument("--output-dir", type=str, default="./outputs/reasoning/reasoning_sft")
@@ -92,6 +53,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--use-8bit-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use bitsandbytes AdamW8bit to reduce optimizer-state memory.",
+    )
+    parser.add_argument(
         "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -111,12 +78,12 @@ def main() -> None:
         )
     logger.setLevel(args.log_level)
 
-    train_dataset = ReasoningSFTDataset(
+    train_dataset = HighSchoolMathReasoningSFTDataset(
         split="train",
         max_samples=args.train_max_samples,
         seed=args.seed,
     )
-    eval_dataset = ReasoningSFTDataset(
+    eval_dataset = HighSchoolMathReasoningSFTDataset(
         split="test",
         max_samples=args.test_max_samples,
         seed=args.seed,
@@ -129,6 +96,8 @@ def main() -> None:
     saving_steps = args.num_steps + 1 if args.save_final_only else args.saving_steps
     if args.save_final_only and args.num_epochs is not None:
         saving_steps = steps_for_checkpoint_interval + 1
+    optimizer_cls = _get_adamw8bit() if args.use_8bit_optimizer else AdamW
+    optimizer_args = {"lr": args.lr} if args.use_8bit_optimizer else {"lr": args.lr, "foreach": False}
 
     trainer = SFTTrainer(
         model=args.model,
@@ -141,7 +110,8 @@ def main() -> None:
         logging_steps=args.logging_steps,
         eval_steps=args.eval_steps,
         max_seq_len=args.max_seq_len,
-        optimizer_args={"lr": args.lr, "foreach": False},
+        optimizer=optimizer_cls,
+        optimizer_args=optimizer_args,
         output_dir=args.output_dir,
         seed=args.seed,
         use_accelerate=args.use_accelerate,

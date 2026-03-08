@@ -26,6 +26,39 @@ CompletionBatch = tuple[torch.Tensor, list[str], list[int], list[int]]
 CompletionBatchWithMask = tuple[torch.Tensor, list[str], list[int], list[int], torch.Tensor]
 
 
+def _resolve_chat_stop_token_ids(tokenizer: Any) -> list[int]:
+    stop_token_ids: list[int] = []
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(eos_token_id, int) and eos_token_id >= 0:
+        stop_token_ids.append(eos_token_id)
+
+    convert_tokens_to_ids = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if callable(convert_tokens_to_ids):
+        im_end_token_id = convert_tokens_to_ids("<|im_end|>")
+        if isinstance(im_end_token_id, int) and im_end_token_id >= 0 and im_end_token_id not in stop_token_ids:
+            stop_token_ids.append(im_end_token_id)
+
+    return stop_token_ids
+
+
+def _merge_stop_token_ids(existing: Any, defaults: list[int]) -> list[int]:
+    stop_token_ids: list[int] = []
+
+    def _extend(value: Any) -> None:
+        if isinstance(value, int):
+            if value >= 0 and value not in stop_token_ids:
+                stop_token_ids.append(value)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                if isinstance(item, int) and item >= 0 and item not in stop_token_ids:
+                    stop_token_ids.append(item)
+
+    _extend(existing)
+    _extend(defaults)
+    return stop_token_ids
+
+
 class _ApplyModelReloadWeights:
     def __init__(self, weight_pairs: list[tuple[str, torch.Tensor]]) -> None:
         self.weight_pairs = weight_pairs
@@ -238,6 +271,7 @@ def build_sampling_params(
     sampling_params_cls: type,
     param_keys: set[str],
     *,
+    tokenizer: Any,
     generation_args: dict[str, Any],
     max_new_tokens: int,
     do_sample: bool,
@@ -257,6 +291,14 @@ def build_sampling_params(
             continue
         if key in param_keys:
             sampling_kwargs[key] = value
+
+    if "stop_token_ids" in param_keys:
+        stop_token_ids = _merge_stop_token_ids(
+            sampling_kwargs.get("stop_token_ids"),
+            _resolve_chat_stop_token_ids(tokenizer),
+        )
+        if stop_token_ids:
+            sampling_kwargs["stop_token_ids"] = stop_token_ids
 
     return sampling_params_cls(**sampling_kwargs)
 
@@ -317,7 +359,7 @@ def sample_completions_batch_vllm(
     completion_lengths: list[int] = []
     prompt_lengths: list[int] = []
     all_token_ids: list[list[int]] = []
-    eos_token_id = tokenizer.eos_token_id
+    stop_token_ids = _resolve_chat_stop_token_ids(tokenizer)
     pad_token_id = tokenizer.pad_token_id
 
     for output in outputs:
@@ -336,11 +378,11 @@ def sample_completions_batch_vllm(
             token_ids = tokenizer.encode(completion.text, add_special_tokens=False)
         token_ids = list(token_ids)
 
-        # Trim at eos
+        # Trim at the earliest configured chat/sequence stop token.
         end_offset = len(token_ids)
-        if eos_token_id is not None:
+        if stop_token_ids:
             for idx, tid in enumerate(token_ids):
-                if tid == eos_token_id:
+                if tid in stop_token_ids:
                     end_offset = idx
                     break
 
