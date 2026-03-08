@@ -460,11 +460,31 @@ def sync_model_weights_to_vllm(model: Any, vllm_engine: Any) -> None:
         ) from exc
 
 
+def _vllm_engine_uses_multi_gpu(vllm_engine: Any) -> bool:
+    parallel_config = None
+    try:
+        parallel_config = vllm_engine.llm_engine.vllm_config.parallel_config
+    except AttributeError:
+        return False
+
+    tensor_parallel_size = int(getattr(parallel_config, "tensor_parallel_size", 1))
+    pipeline_parallel_size = int(getattr(parallel_config, "pipeline_parallel_size", 1))
+    data_parallel_size = int(getattr(parallel_config, "data_parallel_size", 1))
+    return (tensor_parallel_size * pipeline_parallel_size * data_parallel_size) > 1
+
+
 def _sync_model_weights_to_vllm_via_ipc(
     weight_pairs: list[tuple[str, torch.Tensor]],
     vllm_engine: Any,
 ) -> bool:
     if not hasattr(vllm_engine, "init_weight_transfer_engine") or not hasattr(vllm_engine, "update_weights"):
+        return False
+
+    if _vllm_engine_uses_multi_gpu(vllm_engine):
+        logger.info(
+            "Skipping IPC weight transfer for multi-GPU vLLM engine; "
+            "falling back to worker-side load_weights sync."
+        )
         return False
 
     cuda_device_index = next(
@@ -506,7 +526,15 @@ def _sync_model_weights_to_vllm_via_ipc(
             reduce_tensor_fn=reduce_tensor,
         )
         logger.info("Updating vLLM weights via IPC transfer.")
-        vllm_engine.update_weights({"update_info": update_info})
+        try:
+            vllm_engine.update_weights({"update_info": update_info})
+        except Exception as exc:
+            logger.warning(
+                "IPC weight transfer to vLLM failed; falling back to worker-side "
+                "load_weights sync: %s",
+                exc,
+            )
+            return False
 
     logger.info(
         "Synced %d parameter tensors to vLLM via IPC weight transfer.",

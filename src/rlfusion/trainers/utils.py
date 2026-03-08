@@ -1,6 +1,7 @@
 """Trainer utilities: device selection, seeding, formatting, mask helpers."""
 
 import json
+import logging
 import os
 import random
 from pathlib import Path
@@ -15,6 +16,8 @@ from transformers.utils.import_utils import (
 )
 
 from rlfusion.trainers.types import AttentionMask, TokenIds
+
+logger = logging.getLogger(__name__)
 
 def get_device():
 
@@ -59,6 +62,24 @@ def _all_visible_cuda_devices_support(min_major: int) -> bool:
     return True
 
 
+def _flash_attention_backend_usable(implementation: str) -> bool:
+    try:
+        from transformers.modeling_flash_attention_utils import lazy_import_flash_attention
+    except Exception:
+        return False
+
+    try:
+        lazy_import_flash_attention(implementation, force_import=True)
+    except Exception as exc:
+        logger.warning(
+            "Falling back to sdpa because %s is not importable in the current environment: %s",
+            implementation,
+            exc,
+        )
+        return False
+    return True
+
+
 def resolve_attention_implementation(device_map: object) -> str:
     forced_attn_impl = os.getenv("RLFUSION_ATTN_IMPLEMENTATION")
     if forced_attn_impl:
@@ -69,13 +90,13 @@ def resolve_attention_implementation(device_map: object) -> str:
     # FlashAttention-3 is Hopper-only (compute capability >= 9.0).
     if _all_visible_cuda_devices_support(9) and (
         is_flash_attn_3_available() or is_kernels_available()
-    ):
+    ) and _flash_attention_backend_usable("flash_attention_3"):
         return "flash_attention_3"
 
     # FlashAttention-2 supports Ampere/Ada/Hopper CUDA GPUs.
     if _all_visible_cuda_devices_support(8) and (
         is_flash_attn_2_available() or is_kernels_available()
-    ):
+    ) and _flash_attention_backend_usable("flash_attention_2"):
         return "flash_attention_2"
 
     return "sdpa"

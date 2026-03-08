@@ -320,3 +320,58 @@ def test_sync_model_weights_to_vllm_streams_apply_model_payloads_in_chunks(monke
     assert [name for name, _ in engine.calls[0][0]] == ["first"]
     assert [name for name, _ in engine.calls[1][0]] == ["second"]
     assert all(tensor.device.type == "cpu" for call, _ in engine.calls for _name, tensor in call)
+
+
+def test_sync_model_weights_to_vllm_skips_ipc_for_multi_gpu_engines():
+    model = _TinyModel()
+
+    class _ParallelConfig:
+        tensor_parallel_size = 2
+        pipeline_parallel_size = 1
+        data_parallel_size = 1
+
+    class _Engine:
+        def __init__(self) -> None:
+            self.calls = []
+            self.ipc_attempted = False
+            self.llm_engine = type(
+                "_LLMEngine",
+                (),
+                {
+                    "vllm_config": type(
+                        "_Config",
+                        (),
+                        {"parallel_config": _ParallelConfig()},
+                    )()
+                },
+            )()
+
+        def init_weight_transfer_engine(self, _request):
+            self.ipc_attempted = True
+
+        def update_weights(self, _request):
+            self.ipc_attempted = True
+
+        def apply_model(self, fn):
+            class _WorkerModel:
+                def __init__(self) -> None:
+                    self.received = None
+
+                def load_weights(self, weight_pairs):
+                    self.received = list(weight_pairs)
+                    return {name for name, _ in self.received}
+
+            worker_model = _WorkerModel()
+            result = fn(worker_model)
+            self.calls.append((worker_model.received, result))
+            return [result]
+
+    engine = _Engine()
+    sync_model_weights_to_vllm(model, engine)
+
+    assert engine.ipc_attempted is False
+    assert len(engine.calls) == 1
+    transferred, result = engine.calls[0]
+    assert [name for name, _ in transferred] == ["proj.weight"]
+    assert all(tensor.device.type == "cpu" for _name, tensor in transferred)
+    assert result == 1
