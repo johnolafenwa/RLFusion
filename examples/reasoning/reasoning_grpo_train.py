@@ -22,6 +22,13 @@ from rlfusion.envs import EnvBase
 from rlfusion.trainers.grpo_trainer import GRPOTrainer
 from rlfusion.utils import get_boxed_answer
 
+FORMAT_INSTRUCTION = (
+    "Solve the problem and respond in exactly this format:\n"
+    "<think>your reasoning</think>\n"
+    "\\boxed{final answer}\n"
+    "Keep the thinking concise and put the boxed answer after </think>."
+)
+
 
 @dataclass
 class ReasoningRLEnv(EnvBase):
@@ -97,7 +104,7 @@ class ReasoningRLDataset(Dataset):
 
         return ReasoningRLEnv(
             prompt=[
-                {"role": "user", "content": prompt_text}
+                {"role": "user", "content": f"{prompt_text}\n\n{FORMAT_INSTRUCTION}"}
             ],
             answer=answer,
         )

@@ -47,7 +47,12 @@ from rlfusion.trainers.utils import (
     build_completion_mask_from_attention,
     normalize_generation_args,
 )
-from rlfusion.trainers.common import configure_logging, is_main_process, unwrap_model_for_saving
+from rlfusion.trainers.common import (
+    configure_logging,
+    end_training,
+    is_main_process,
+    unwrap_model_for_saving,
+)
 from rlfusion.envs import EnvBase
 
 logger = logging.getLogger(__name__)
@@ -342,9 +347,17 @@ class GRPOTrainer():
         self._vllm_sampling_params_cls: Any = None
         self._vllm_sampling_param_keys: Any = None
         if self.use_vllm:
+            vllm_local_cuda_device_index = None
+            if self.accelerator is not None and self.device == "cuda":
+                vllm_local_cuda_device_index = int(self.accelerator.local_process_index)
             try:
                 self._vllm_engine, self._vllm_sampling_params_cls, self._vllm_sampling_param_keys = (
-                    load_vllm_engine(model, resolved_vllm_args)
+                    load_vllm_engine(
+                        model,
+                        resolved_vllm_args,
+                        local_cuda_device_index=vllm_local_cuda_device_index,
+                        enable_weight_transfer=True,
+                    )
                 )
             except ImportError as exc:
                 if auto_selected_vllm:
@@ -578,6 +591,13 @@ class GRPOTrainer():
 
         return -(obj.sum(dim=1) / denom) + (kl_beta * (kl.sum(dim=1) / denom))
 
+    def _should_skip_policy_update(self, advantages: torch.Tensor) -> bool:
+        if advantages.numel() == 0:
+            return True
+        if not torch.isfinite(advantages).all():
+            raise ValueError("advantages must be finite.")
+        return not bool(torch.count_nonzero(advantages).item())
+
     def generate_mask(
         self,
         trajectory: Trajectory,
@@ -645,6 +665,7 @@ class GRPOTrainer():
         ratio_max = float(batch_stats.get("ratio_max", 0.0))
         mask_tokens_mean = float(batch_stats.get("mask_tokens_mean", 0.0))
         completion_tokens_mean = float(batch_stats.get("completion_tokens_mean", 0.0))
+        skipped_policy_update = bool(batch_stats.get("skipped_policy_update", False))
 
         logger.info(
             "step %d reward_mean=%.4f reward_std=%.4f adv_mean=%.4f adv_std=%.4f loss_mean=%.4f loss_std=%.4f",
@@ -665,6 +686,11 @@ class GRPOTrainer():
             mask_tokens_mean,
             completion_tokens_mean,
         )
+        if skipped_policy_update:
+            logger.info(
+                "step %d skipped policy update because all sampled advantages were zero.",
+                step,
+            )
         if self.log_completions:
             prompt_text = format_prompt(env.prompt)
             logger.info("prompt: %s", truncate_text(prompt_text, self.max_log_chars))
@@ -798,56 +824,68 @@ class GRPOTrainer():
                 device=sequences.device,
                 dtype=old_log_probs.dtype,
             )
+            mask_counts = masks.sum(dim=1)
             batch_stats = None
-            for ppo_step in range(self.ppo_steps):
-                self.optimizer.zero_grad(set_to_none=True)
-                new_log_probs = self.get_log_probs(sequences, attention_mask=full_attention_mask)
+            if self._should_skip_policy_update(advantages):
+                batch_stats = {
+                    "loss_mean": 0.0,
+                    "loss_std": 0.0,
+                    "ratio_mean": 1.0,
+                    "ratio_min": 1.0,
+                    "ratio_max": 1.0,
+                    "mask_tokens_mean": float(mask_counts.mean().item()),
+                    "completion_tokens_mean": float(completion_lengths.mean().item()),
+                    "skipped_policy_update": True,
+                }
+            else:
+                for ppo_step in range(self.ppo_steps):
+                    self.optimizer.zero_grad(set_to_none=True)
+                    new_log_probs = self.get_log_probs(sequences, attention_mask=full_attention_mask)
 
-                loss_per = self.grpo_loss_batch(
-                    old_log_probs,
-                    new_log_probs,
-                    ref_log_probs,
-                    masks,
-                    advantages,
-                    eps=self.clip_eps,
-                    kl_beta=self.kl_penalty,
-                )
-                loss = loss_per.mean()
-                if self.accelerator is None:
-                    loss.backward()
-                else:
-                    self.accelerator.backward(loss)
-                if self.max_grad_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.optimizer.step()
-                if self.use_vllm:
-                    self._vllm_dirty = True
-                if self.lr_scheduler is not None:
-                    self.lr_scheduler.step()
+                    loss_per = self.grpo_loss_batch(
+                        old_log_probs,
+                        new_log_probs,
+                        ref_log_probs,
+                        masks,
+                        advantages,
+                        eps=self.clip_eps,
+                        kl_beta=self.kl_penalty,
+                    )
+                    loss = loss_per.mean()
+                    if self.accelerator is None:
+                        loss.backward()
+                    else:
+                        self.accelerator.backward(loss)
+                    if self.max_grad_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    self.optimizer.step()
+                    if self.use_vllm:
+                        self._vllm_dirty = True
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
 
-                if ppo_step == self.ppo_steps - 1:
-                    ratio = torch.exp(new_log_probs.detach() - old_log_probs)
-                    mask_bool = masks.bool()
-                    mask_counts = masks.sum(dim=1)
-                    denom = mask_counts.clamp_min(1.0)
-                    ratio_mean_per = (ratio * masks).sum(dim=1) / denom
+                    if ppo_step == self.ppo_steps - 1:
+                        ratio = torch.exp(new_log_probs.detach() - old_log_probs)
+                        mask_bool = masks.bool()
+                        denom = mask_counts.clamp_min(1.0)
+                        ratio_mean_per = (ratio * masks).sum(dim=1) / denom
 
-                    ratio_min_per = ratio.masked_fill(~mask_bool, float("inf")).min(dim=1).values
-                    ratio_max_per = ratio.masked_fill(~mask_bool, float("-inf")).max(dim=1).values
-                    empty_mask = mask_counts == 0
-                    if empty_mask.any():
-                        ratio_min_per = torch.where(empty_mask, torch.zeros_like(ratio_min_per), ratio_min_per)
-                        ratio_max_per = torch.where(empty_mask, torch.zeros_like(ratio_max_per), ratio_max_per)
+                        ratio_min_per = ratio.masked_fill(~mask_bool, float("inf")).min(dim=1).values
+                        ratio_max_per = ratio.masked_fill(~mask_bool, float("-inf")).max(dim=1).values
+                        empty_mask = mask_counts == 0
+                        if empty_mask.any():
+                            ratio_min_per = torch.where(empty_mask, torch.zeros_like(ratio_min_per), ratio_min_per)
+                            ratio_max_per = torch.where(empty_mask, torch.zeros_like(ratio_max_per), ratio_max_per)
 
-                    batch_stats = {
-                        "loss_mean": float(loss_per.mean().item()),
-                        "loss_std": float(loss_per.std(unbiased=False).item()),
-                        "ratio_mean": float(ratio_mean_per.mean().item()),
-                        "ratio_min": float(ratio_min_per.min().item()),
-                        "ratio_max": float(ratio_max_per.max().item()),
-                        "mask_tokens_mean": float(mask_counts.mean().item()),
-                        "completion_tokens_mean": float(completion_lengths.mean().item()),
-                    }
+                        batch_stats = {
+                            "loss_mean": float(loss_per.mean().item()),
+                            "loss_std": float(loss_per.std(unbiased=False).item()),
+                            "ratio_mean": float(ratio_mean_per.mean().item()),
+                            "ratio_min": float(ratio_min_per.min().item()),
+                            "ratio_max": float(ratio_max_per.max().item()),
+                            "mask_tokens_mean": float(mask_counts.mean().item()),
+                            "completion_tokens_mean": float(completion_lengths.mean().item()),
+                        }
 
             log_env = env_batch[0] if env_batch else envs[0]
             self._log_step(step + 1, log_env, trajectories, batch_stats)
@@ -881,6 +919,7 @@ class GRPOTrainer():
 
         if self._wandb is not None:
             self._wandb.finish()
+        end_training(self.accelerator)
 
     def test(
         self,

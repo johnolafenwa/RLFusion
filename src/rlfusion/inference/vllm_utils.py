@@ -7,6 +7,7 @@ import inspect
 import logging
 import os
 from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Literal, overload
 
 import torch
@@ -16,6 +17,7 @@ from rlfusion.envs import EnvBase
 logger = logging.getLogger(__name__)
 _APPLY_MODEL_SYNC_LOGGED = False
 _APPLY_MODEL_SYNC_MAX_CHUNK_BYTES = 1 << 30
+_IPC_WEIGHT_TRANSFER_INIT_ATTR = "_rlfusion_ipc_weight_transfer_initialized"
 DEFAULT_COLOCATED_VLLM_ARGS: dict[str, Any] = {
     "gpu_memory_utilization": 0.5,
 }
@@ -88,7 +90,73 @@ def ensure_vllm_env() -> None:
         )
 
 
-def load_vllm_engine(model_path_or_id: str, vllm_args: dict[str, Any]) -> tuple[Any, type, set[str]]:
+def resolve_local_vllm_visible_device(
+    local_cuda_device_index: int | None,
+    *,
+    cuda_visible_devices: str | None,
+    cuda_device_count: int,
+) -> str | None:
+    if local_cuda_device_index is None:
+        return None
+    if local_cuda_device_index < 0:
+        return None
+
+    if cuda_visible_devices is not None:
+        visible_devices = [device.strip() for device in cuda_visible_devices.split(",") if device.strip()]
+        if not visible_devices:
+            return None
+        if local_cuda_device_index >= len(visible_devices):
+            return None
+        return visible_devices[local_cuda_device_index]
+
+    if local_cuda_device_index >= cuda_device_count:
+        return None
+    return str(local_cuda_device_index)
+
+
+@contextmanager
+def pin_vllm_to_local_cuda_device(local_cuda_device_index: int | None) -> Iterator[None]:
+    if local_cuda_device_index is None:
+        yield
+        return
+
+    resolved_visible_device = resolve_local_vllm_visible_device(
+        local_cuda_device_index,
+        cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
+        cuda_device_count=torch.cuda.device_count(),
+    )
+    if resolved_visible_device is None:
+        logger.warning(
+            "Could not narrow CUDA_VISIBLE_DEVICES for local vLLM rank %s; "
+            "continuing with the current process visibility.",
+            local_cuda_device_index,
+        )
+        yield
+        return
+
+    previous_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = resolved_visible_device
+    logger.info(
+        "Pinned colocated vLLM startup to CUDA_VISIBLE_DEVICES=%s for local rank %s.",
+        resolved_visible_device,
+        local_cuda_device_index,
+    )
+    try:
+        yield
+    finally:
+        if previous_visible_devices is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = previous_visible_devices
+
+
+def load_vllm_engine(
+    model_path_or_id: str,
+    vllm_args: dict[str, Any],
+    *,
+    local_cuda_device_index: int | None = None,
+    enable_weight_transfer: bool = False,
+) -> tuple[Any, type, set[str]]:
     ensure_vllm_env()
     try:
         vllm_mod = importlib.import_module("vllm")
@@ -97,7 +165,12 @@ def load_vllm_engine(model_path_or_id: str, vllm_args: dict[str, Any]) -> tuple[
     except Exception as exc:
         raise ImportError("vllm is required for engine='vllm'.") from exc
 
-    llm = llm_cls(model=model_path_or_id, **vllm_args)
+    llm_args = dict(vllm_args)
+    if enable_weight_transfer:
+        llm_args.setdefault("weight_transfer_config", {"backend": "ipc"})
+
+    with pin_vllm_to_local_cuda_device(local_cuda_device_index):
+        llm = llm_cls(model=model_path_or_id, **llm_args)
     param_keys = set(inspect.signature(sampling_params_cls).parameters.keys())
     return llm, sampling_params_cls, param_keys
 
@@ -326,8 +399,12 @@ def sync_model_weights_to_vllm(model: Any, vllm_engine: Any) -> None:
     # Collect (name, tensor) pairs
     weight_pairs = [(name, param.detach()) for name, param in unwrapped.named_parameters()]
 
+    if _sync_model_weights_to_vllm_via_ipc(weight_pairs, vllm_engine):
+        return
+
     # Current vLLM releases expose load_weights() directly on the LLM object.
     if hasattr(vllm_engine, "load_weights"):
+        logger.info("Syncing %d parameter tensors to vLLM via load_weights().", len(weight_pairs))
         vllm_engine.load_weights(weight_pairs)
         logger.info("Synced %d parameter tensors to vLLM via load_weights().", len(weight_pairs))
         return
@@ -381,6 +458,89 @@ def sync_model_weights_to_vllm(model: Any, vllm_engine: Any) -> None:
             "Unable to sync weights to vLLM engine. "
             "Ensure you are using a compatible vLLM version."
         ) from exc
+
+
+def _sync_model_weights_to_vllm_via_ipc(
+    weight_pairs: list[tuple[str, torch.Tensor]],
+    vllm_engine: Any,
+) -> bool:
+    if not hasattr(vllm_engine, "init_weight_transfer_engine") or not hasattr(vllm_engine, "update_weights"):
+        return False
+
+    cuda_device_index = next(
+        (
+            int(tensor.device.index)
+            for _, tensor in weight_pairs
+            if tensor.device.type == "cuda" and tensor.device.index is not None
+        ),
+        None,
+    )
+    if cuda_device_index is None:
+        return False
+
+    try:
+        from torch.multiprocessing.reductions import reduce_tensor
+    except Exception:
+        return False
+
+    try:
+        if not getattr(vllm_engine, _IPC_WEIGHT_TRANSFER_INIT_ATTR, False):
+            logger.info("Initializing vLLM IPC weight transfer engine.")
+            vllm_engine.init_weight_transfer_engine({"init_info": {}})
+            setattr(vllm_engine, _IPC_WEIGHT_TRANSFER_INIT_ATTR, True)
+    except RuntimeError as exc:
+        if "Weight transfer not configured" in str(exc):
+            return False
+        raise
+
+    with torch.cuda.device(cuda_device_index):
+        gpu_uuid = str(torch.cuda.get_device_properties(cuda_device_index).uuid)
+        logger.info(
+            "Building IPC weight-transfer payload for %d parameter tensors on CUDA device %d.",
+            len(weight_pairs),
+            cuda_device_index,
+        )
+        update_info, _retained_weights = _build_ipc_weight_update_info(
+            weight_pairs,
+            gpu_uuid=gpu_uuid,
+            reduce_tensor_fn=reduce_tensor,
+        )
+        logger.info("Updating vLLM weights via IPC transfer.")
+        vllm_engine.update_weights({"update_info": update_info})
+
+    logger.info(
+        "Synced %d parameter tensors to vLLM via IPC weight transfer.",
+        len(weight_pairs),
+    )
+    return True
+
+
+def _build_ipc_weight_update_info(
+    weight_pairs: list[tuple[str, torch.Tensor]],
+    *,
+    gpu_uuid: str,
+    reduce_tensor_fn: Any,
+) -> tuple[dict[str, Any], list[torch.Tensor]]:
+    names: list[str] = []
+    dtype_names: list[str] = []
+    shapes: list[list[int]] = []
+    ipc_handles: list[dict[str, Any]] = []
+    retained_weights: list[torch.Tensor] = []
+
+    for name, tensor in weight_pairs:
+        weight = tensor.detach().contiguous()
+        names.append(name)
+        dtype_names.append(str(weight.dtype).split(".")[-1])
+        shapes.append(list(weight.shape))
+        ipc_handles.append({gpu_uuid: reduce_tensor_fn(weight)})
+        retained_weights.append(weight)
+
+    return {
+        "names": names,
+        "dtype_names": dtype_names,
+        "shapes": shapes,
+        "ipc_handles": ipc_handles,
+    }, retained_weights
 
 
 # ---------------------------------------------------------------------------

@@ -47,7 +47,12 @@ from rlfusion.trainers.utils import (
     build_completion_mask_from_attention,
     normalize_generation_args,
 )
-from rlfusion.trainers.common import configure_logging, is_main_process, unwrap_model_for_saving
+from rlfusion.trainers.common import (
+    configure_logging,
+    end_training,
+    is_main_process,
+    unwrap_model_for_saving,
+)
 
 logger = logging.getLogger(__name__)
 if _USING_LIGER:
@@ -311,9 +316,17 @@ class OnPolicyDistillationTrainer:
         self._vllm_sampling_params_cls: Any = None
         self._vllm_sampling_param_keys: Any = None
         if self.use_vllm:
+            vllm_local_cuda_device_index = None
+            if self.accelerator is not None and self.device == "cuda":
+                vllm_local_cuda_device_index = int(self.accelerator.local_process_index)
             try:
                 self._vllm_engine, self._vllm_sampling_params_cls, self._vllm_sampling_param_keys = (
-                    load_vllm_engine(model, resolved_vllm_args)
+                    load_vllm_engine(
+                        model,
+                        resolved_vllm_args,
+                        local_cuda_device_index=vllm_local_cuda_device_index,
+                        enable_weight_transfer=True,
+                    )
                 )
             except ImportError as exc:
                 if auto_selected_vllm:
@@ -773,6 +786,7 @@ class OnPolicyDistillationTrainer:
 
         if self._wandb is not None:
             self._wandb.finish()
+        end_training(self.accelerator)
 
     def test(
         self,

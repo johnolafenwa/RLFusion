@@ -24,6 +24,12 @@ from rlfusion.trainers.grpo_trainer import GRPOTrainer
 from rlfusion.utils import get_boxed_answer
 
 DEFAULT_SFT_CHECKPOINT = "./outputs/qwen3_4b_instruct_2507_reasoning_sft/final"
+FORMAT_INSTRUCTION = (
+    "Solve the problem and respond in exactly this format:\n"
+    "<think>your reasoning</think>\n"
+    "\\boxed{final answer}\n"
+    "Keep the thinking concise and put the boxed answer after </think>."
+)
 
 
 def _get_adamw8bit() -> object:
@@ -107,7 +113,12 @@ class ReasoningRLDataset(Dataset):
             raise ValueError("Dataset row missing required field: answer.")
 
         return ReasoningRLEnv(
-            prompt=[{"role": "user", "content": str(row["problem"])}],
+            prompt=[
+                {
+                    "role": "user",
+                    "content": f"{row['problem']}\n\n{FORMAT_INSTRUCTION}",
+                }
+            ],
             answer=str(row["answer"]),
         )
 
@@ -165,8 +176,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vllm-gpu-memory-utilization",
         type=float,
-        default=0.3,
-        help="vLLM GPU memory utilization (0-1).",
+        default=0.5,
+        help="vLLM GPU memory utilization (0-1). Use at least 0.5 for this colocated 4B setup.",
     )
     parser.add_argument(
         "--vllm-tensor-parallel-size",
@@ -178,6 +189,12 @@ def parse_args() -> argparse.Namespace:
         "--vllm-enable-sleep",
         action="store_true",
         help="Enable vLLM sleep mode between generations to free GPU memory during training.",
+    )
+    parser.add_argument(
+        "--vllm-enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Disable vLLM torch.compile/CUDA-graph startup for this colocated 4B setup.",
     )
     parser.add_argument(
         "--vllm-max-model-len",
@@ -209,6 +226,7 @@ def main() -> None:
         "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
         "tensor_parallel_size": args.vllm_tensor_parallel_size,
         "max_model_len": args.vllm_max_model_len,
+        "enforce_eager": args.vllm_enforce_eager,
     }
 
     trainer = GRPOTrainer(

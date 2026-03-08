@@ -23,3 +23,11 @@ def unwrap_model_for_saving(model: torch.nn.Module, accelerator: Any) -> torch.n
     if accelerator is None:
         return model
     return cast(torch.nn.Module, accelerator.unwrap_model(model))
+
+
+def end_training(accelerator: Any) -> None:
+    if accelerator is None:
+        return
+    end_training_fn = getattr(accelerator, "end_training", None)
+    if callable(end_training_fn):
+        end_training_fn()

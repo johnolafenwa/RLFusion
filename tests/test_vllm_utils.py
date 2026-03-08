@@ -6,8 +6,11 @@ import torch
 import rlfusion.inference.vllm_utils as vllm_utils
 from rlfusion.envs import EnvBase
 from rlfusion.inference.vllm_utils import (
+    _build_ipc_weight_update_info,
     ensure_vllm_env,
+    pin_vllm_to_local_cuda_device,
     prepare_vllm_runtime_args,
+    resolve_local_vllm_visible_device,
     resolve_vllm_training_config,
     sample_completions_batch_vllm,
     sync_model_weights_to_vllm,
@@ -138,6 +141,35 @@ def test_prepare_vllm_runtime_args_rejects_multi_gpu_vllm_with_accelerate():
         )
 
 
+def test_resolve_local_vllm_visible_device_uses_process_local_gpu_index():
+    resolved = resolve_local_vllm_visible_device(
+        1,
+        cuda_visible_devices=None,
+        cuda_device_count=2,
+    )
+
+    assert resolved == "1"
+
+
+def test_resolve_local_vllm_visible_device_respects_existing_cuda_visible_devices():
+    resolved = resolve_local_vllm_visible_device(
+        1,
+        cuda_visible_devices="4,7",
+        cuda_device_count=8,
+    )
+
+    assert resolved == "7"
+
+
+def test_pin_vllm_to_local_cuda_device_restores_previous_env(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,5")
+
+    with pin_vllm_to_local_cuda_device(1):
+        assert os.environ["CUDA_VISIBLE_DEVICES"] == "5"
+
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "2,5"
+
+
 def test_resolve_vllm_training_config_defaults_to_vllm_on_cuda():
     use_vllm, resolved_args, auto_selected = resolve_vllm_training_config(
         device="cuda",
@@ -175,6 +207,26 @@ def test_resolve_vllm_training_config_rejects_non_cuda_vllm():
             enable_sleep=False,
             use_accelerate=False,
         )
+
+
+def test_build_ipc_weight_update_info_creates_per_tensor_handles():
+    model = _TinyModel()
+
+    def _reduce_tensor(tensor):
+        return ("rebuild", (tuple(tensor.shape), str(tensor.dtype)))
+
+    update_info, retained_weights = _build_ipc_weight_update_info(
+        list(model.named_parameters()),
+        gpu_uuid="GPU-123",
+        reduce_tensor_fn=_reduce_tensor,
+    )
+
+    assert update_info["names"] == ["proj.weight"]
+    assert update_info["dtype_names"] == ["float32"]
+    assert update_info["shapes"] == [[2, 2]]
+    assert update_info["ipc_handles"] == [{"GPU-123": ("rebuild", ((2, 2), "torch.float32"))}]
+    assert len(retained_weights) == 1
+    assert retained_weights[0].device.type == "cpu"
 
 
 class _TinyModel(torch.nn.Module):

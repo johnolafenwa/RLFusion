@@ -26,7 +26,12 @@ from transformers import AutoTokenizer
 
 from rlfusion.envs import EnvBase
 from rlfusion.inference.hf_utils import sample_completions_batch_hf
-from rlfusion.trainers.common import configure_logging, is_main_process, unwrap_model_for_saving
+from rlfusion.trainers.common import (
+    configure_logging,
+    end_training,
+    is_main_process,
+    unwrap_model_for_saving,
+)
 from rlfusion.trainers.utils import (
     get_device,
     set_seed,
@@ -595,6 +600,7 @@ class SFTTrainer:
 
         if self._wandb is not None:
             self._wandb.finish()
+        end_training(getattr(self, "accelerator", None))
 
     def test(
         self,

@@ -51,6 +51,16 @@ class _CountingScheduler:
         self.step_count += 1
 
 
+class _CountingOptimizer(torch.optim.SGD):
+    def __init__(self, params, lr: float) -> None:
+        super().__init__(params, lr=lr)
+        self.step_count = 0
+
+    def step(self, closure=None):
+        self.step_count += 1
+        return super().step(closure)
+
+
 def test_grpo_train_rolls_out_in_eval_mode_and_steps_scheduler_per_update(tmp_path):
     trainer = GRPOTrainer.__new__(GRPOTrainer)
     trainer.train_dataset = [_RewardEnv(prompt=[{"role": "user", "content": "q"}], answer="x")]
@@ -103,6 +113,58 @@ def test_grpo_train_rolls_out_in_eval_mode_and_steps_scheduler_per_update(tmp_pa
     assert trainer.model.forward_modes[0] is False
     assert trainer.model.forward_modes[1:] == [True, True, True]
     assert trainer.lr_scheduler.step_count == trainer.ppo_steps
+
+
+def test_grpo_train_skips_all_zero_advantage_batches_without_dirtying_vllm(tmp_path):
+    trainer = GRPOTrainer.__new__(GRPOTrainer)
+    trainer.train_dataset = [_RewardEnv(prompt=[{"role": "user", "content": "q"}], answer="x")]
+    trainer.eval_steps = None
+    trainer.eval_dataset = None
+    trainer.model = _TrackingModel()
+    trainer.ref_model = None
+    trainer.tokenizer = _TrackingTokenizer()
+    trainer.optimizer = _CountingOptimizer(trainer.model.parameters(), lr=0.1)
+    trainer.lr_scheduler = _CountingScheduler()
+    trainer.accelerator = None
+    trainer.num_epochs = None
+    trainer.num_steps = 1
+    trainer.batch_size = 1
+    trainer.group_size = 2
+    trainer.ppo_steps = 3
+    trainer.clip_eps = 0.2
+    trainer.kl_penalty = 0.0
+    trainer.max_error = 100.0
+    trainer.invalid_penalty = 1.0
+    trainer.max_grad_norm = None
+    trainer.logging_steps = 1
+    trainer.saving_steps = 10
+    trainer.output_dir = tmp_path
+    trainer.log_completions = False
+    trainer.max_log_chars = 100
+    trainer._wandb = None
+    trainer.use_vllm = True
+    trainer.vllm_enable_sleep = False
+    trainer._vllm_dirty = False
+    trainer.sampling_temperature = 0.7
+
+    def _sample(envs):
+        _ = envs
+        return (
+            torch.tensor([[5, 0], [5, 1]], dtype=torch.long),
+            ["bad", "bad"],
+            [1, 1],
+            [1, 1],
+            torch.tensor([[1, 1], [1, 1]], dtype=torch.long),
+        )
+
+    trainer._sample_completions_batch_with_mask = _sample
+
+    trainer.train()
+
+    assert trainer.optimizer.step_count == 0
+    assert trainer.lr_scheduler.step_count == 0
+    assert trainer._vllm_dirty is False
+    assert trainer.model.forward_modes == [False]
 
 
 def test_onpolicy_train_rolls_out_in_eval_mode_and_steps_scheduler_per_update(tmp_path):
