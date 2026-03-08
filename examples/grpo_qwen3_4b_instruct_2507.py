@@ -23,7 +23,11 @@ from rlfusion.envs import EnvBase
 from rlfusion.trainers.grpo_trainer import GRPOTrainer
 from rlfusion.utils import get_boxed_answer
 
+BASE_MODEL_ID = "Qwen/Qwen3-4B-Instruct-2507"
 DEFAULT_SFT_CHECKPOINT = "./outputs/qwen3_4b_instruct_2507_reasoning_sft/final"
+THINK_REWARD = 0.3
+BOX_REWARD = 0.2
+CORRECT_REWARD = 0.5
 FORMAT_INSTRUCTION = (
     "Solve the problem and respond in exactly this format:\n"
     "<think>your reasoning</think>\n"
@@ -51,27 +55,25 @@ class ReasoningRLEnv(EnvBase):
         text = str(prediction)
         think_open = "<think>"
         think_close = "</think>"
+        reward = 0.0
+        answer_text = text
 
-        if not text.startswith(think_open):
-            return 0.0
-
-        close_idx = text.find(think_close)
-        if close_idx == -1:
-            return 0.0
-
-        think_content = text[len(think_open) : close_idx]
-        if not think_content.strip():
-            return 0.0
-
-        answer_text = text[close_idx + len(think_close) :]
-        if not answer_text.strip():
-            return 0.0
+        if text.startswith(think_open):
+            close_idx = text.find(think_close)
+            if close_idx != -1:
+                think_content = text[len(think_open) : close_idx]
+                if think_content.strip():
+                    reward += THINK_REWARD
+                    answer_text = text[close_idx + len(think_close) :]
 
         boxed = get_boxed_answer(answer_text)
         if boxed is None:
-            return 0.0
+            return reward
 
-        return 1.0 if boxed == str(self.answer) else 0.0
+        reward += BOX_REWARD
+        if boxed == str(self.answer):
+            reward += CORRECT_REWARD
+        return reward
 
 
 class ReasoningRLDataset(Dataset):
@@ -126,6 +128,12 @@ class ReasoningRLDataset(Dataset):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run GRPO on reasoning-rl from a Qwen3-4B reasoning-format SFT checkpoint."
+    )
+    parser.add_argument(
+        "--base-tokenizer",
+        type=str,
+        default=BASE_MODEL_ID,
+        help="Tokenizer to use for vLLM rollouts when training from a local SFT checkpoint.",
     )
     parser.add_argument(
         "--sft-checkpoint",
@@ -227,6 +235,7 @@ def main() -> None:
         "tensor_parallel_size": args.vllm_tensor_parallel_size,
         "max_model_len": args.vllm_max_model_len,
         "enforce_eager": args.vllm_enforce_eager,
+        "tokenizer": args.base_tokenizer,
     }
 
     trainer = GRPOTrainer(
